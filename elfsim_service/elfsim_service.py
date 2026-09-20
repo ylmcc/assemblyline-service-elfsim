@@ -23,11 +23,12 @@ from assemblyline_v4_service.common.task import PARENT_RELATION
 
 from elfsim_service.emulator import UnsupportedElf, emulate
 from elfsim_service.network import LiveNetwork
-from elfsim_service.textview import readable, text_runs
+from elfsim_service.textview import line_summary, printable_ratio, readable, strip_ansi, text_runs
 
 MAX_ROWS = 30
 MAX_CONVERSATIONS = 8
 MAX_TRANSCRIPT_LINES = 25
+LINE_SUMMARY_MIN = 6            # a text conversation with this many lines is summarised, not listed
 MAX_EXTRACTED = 10
 SHELLS = ("sh", "bash", "dash", "ash", "busybox")
 PAYLOAD_MIN_BYTES = 64          # a received stream at least this big is extracted as a payload
@@ -59,7 +60,10 @@ def _transcript(proto: str, messages: tuple, reps: list) -> list:
     adjacent one-off sends read as a single stream; UDP datagrams stay separate. Repeated sends
     (heartbeats) become one line with a count or range."""
     lines, pending = [], b""
-    for (data, _), (low, high) in zip(messages, reps):
+    for (raw, _), (low, high) in zip(messages, reps):
+        data = strip_ansi(raw)                    # colour codes are noise in a transcript
+        if not data:
+            continue
         if high == 1:
             if proto == "tcp":
                 pending += data
@@ -73,6 +77,29 @@ def _transcript(proto: str, messages: tuple, reps: list) -> list:
     if pending:
         lines.append(readable(pending))
     return lines[:MAX_TRANSCRIPT_LINES]
+
+
+def _body_lines(proto: str, messages: tuple, reps: list) -> list:
+    """Readable lines for one conversation: a compact summary for text (login attempts, commands),
+    otherwise the transcript, plus the printable text found in a binary protocol."""
+    stream = b"".join(strip_ansi(m) * max(hi, 1) for (m, _), (_, hi) in zip(messages, reps))[:1 << 20]
+    stripped = any(strip_ansi(m) != m for m, _ in messages)
+    summary = line_summary(stream) if printable_ratio(stream) >= 0.9 else None
+    if summary and summary[0] >= LINE_SUMMARY_MIN:
+        total, distinct, top = summary
+        lines = [f"{total} lines, {distinct} distinct" + (" (colour codes removed)" if stripped else "")]
+        lines += [f"{text}    x{n}" for text, n in top]
+        if distinct > len(top):
+            lines.append(f"... {distinct - len(top)} more distinct")
+        return lines
+    lines = _transcript(proto, messages, reps)
+    if stripped:
+        lines.append("(colour codes removed)")
+    if printable_ratio(stream) < 0.9:               # binary protocol: pull out the names hidden in it
+        words = text_runs(stream)
+        if words:
+            lines.append("readable text: " + ", ".join(f'"{w}"' for w in words))
+    return lines
 
 
 class ElfSim(ServiceBase):
@@ -222,10 +249,7 @@ class ElfSim(ServiceBase):
             title = f"-> {proto}://{ip}:{port}"
             if group["connections"] > 1:
                 title += f"   (identical in {group['connections']} connections)"
-            lines = [title] + ["    " + l for l in _transcript(proto, messages, group["reps"])]
-            words = text_runs(b"".join(m for m, _ in messages))
-            if words:
-                lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
+            lines = [title] + ["    " + l for l in _body_lines(proto, messages, group["reps"])]
             blocks.append("\n".join(lines))
 
         section = ResultSection(
@@ -250,9 +274,10 @@ class ElfSim(ServiceBase):
                 else:
                     runs.append([chunk, 1])
             lines = [f"<- {ip}:{port}"]
-            lines += [f"    {readable(c, 300)}" + (f"    x{n}" if n > 1 else "") for c, n in runs[:MAX_TRANSCRIPT_LINES]]
+            lines += [f"    {readable(strip_ansi(c), 300)}" + (f"    x{n}" if n > 1 else "")
+                      for c, n in runs[:MAX_TRANSCRIPT_LINES]]
             data = b"".join(chunks)
-            words = text_runs(data)
+            words = text_runs(data) if printable_ratio(data) < 0.9 else []
             if words:
                 lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
             blocks.append("\n".join(lines))

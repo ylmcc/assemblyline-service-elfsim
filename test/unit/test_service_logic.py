@@ -258,3 +258,27 @@ def test_sh_dash_c_commands_are_extracted_as_scripts_for_bashsim_and_payloadfetc
 def test_non_shell_execs_and_plain_shell_starts_are_not_extracted(tmp_path, monkeypatch):
     events = [_exec("/usr/bin/wget", "-O", "x", "http://198.51.100.7/"), _exec("/bin/sh"), _exec("sh", "-c")]
     assert _scripts(events, tmp_path, monkeypatch) == []
+
+
+
+# ---- output clean-up: colour codes and login-attempt noise --------------------------------
+def test_ansi_colours_are_removed_and_plain_text_gets_no_readable_text_line():
+    banner = b"\x1b[0m[\x1b[1;31mSnoopy.\x1b[0m][\x1b[1;31m0.0.0.0\x1b[0m] \x1b[1;31m>\x1b[0m [Unknown]\n"
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[banner, 1]])] * 147))
+    assert "\\x1b" not in section.body and "[Snoopy.][0.0.0.0] > [Unknown]" in section.body
+    assert "readable text" not in section.body and "(identical in 147 connections)" in section.body
+    assert "(colour codes removed)" in section.body
+
+
+def test_a_telnet_login_brute_force_is_summarised_not_listed():
+    attempts = ([[b"root\r\n", 27], [b"admin\r\n", 15], [b"support\r\n", 2], [b"guest\r\n", 1], [b"ubnt\r\n", 2]])
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv(attempts, ip="203.0.113.9", port=23)]))
+    lines = section.body.splitlines()
+    assert "47 lines, 5 distinct" in section.body
+    assert any(l.strip() == "root    x27" for l in lines) and len(lines) <= 8
+    assert "readable text" not in section.body
+
+
+def test_binary_protocols_still_get_readable_text_without_duplicates():
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[b"\x00\x00\x00\x01\x04px86\x03x86\x04px86", 1]])]))
+    assert section.body.count('"px86"') == 1
