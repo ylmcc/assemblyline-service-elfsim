@@ -28,7 +28,7 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | Emulation summary | architecture, entry point, why emulation stopped, syscalls emulated |
 | Network connections attempted | TCP/UDP connects and binds; tags `network.dynamic.ip`, `network.port`, `network.protocol` |
 | DNS lookups | domain parsed from the query and answered with a documentation-range sinkhole so the sample carries on to its real C2 connect; tags `network.dynamic.domain` |
-| Data the sample sent | first bytes of what it sent (e.g. a C2 registration message), hex and ascii |
+| What the sample sent | a readable transcript per distinct conversation: control bytes as `\xNN`, adjacent TCP sends joined, repeats as `xN`, plus the printable text found (hex only in the supplementary JSON) |
 | Process activity | `fork`/`setsid` daemonising, `prctl` renames, `execve` (with argv), `kill`, `ptrace` probes |
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |
 | Emulation stopped on a CPU fault | faulting pc, instruction bytes and the reason |
@@ -70,8 +70,9 @@ starve the rest of the program. Unknown syscalls are answered `-ENOSYS` and repo
 - Truncated files are loaded the way a kernel would (missing bytes read as zero) and the summary
   says so. A UPX-packed sample must be complete for any unpacker to work on it.
 - Memory is snapshotted at `fork()`, but the fake filesystem and network log are shared.
-- Threads (`clone` with `CLONE_VM`) are not emulated, and TLS setup (`set_thread_area`) returns
-  `-ENOSYS`; a sample that needs either stops with a fault and says so.
+- Threads (`clone` with `CLONE_VM`) are not emulated. On x86, TLS setup (`set_thread_area`) returns
+  `-ENOSYS` (MIPS handles it via the CP0 UserLocal register); a sample that needs either stops with
+  a fault and says so.
 
 ## Development
 
@@ -83,8 +84,8 @@ python3 -m venv .venv
 .venv/bin/pytest test/
 ```
 
-The tests build tiny synthetic i386 ELF files from a handful of opcodes
-(`test/unit/elfbuilder.py`, `test/unit/demo_bot.py`). They are inert fixtures, contain no real
+The tests build tiny synthetic i386 and MIPS ELF files from a handful of opcodes
+(`test/unit/elfbuilder.py`, `test/unit/mipsbuilder.py`, `test/unit/demo_bot.py`). They are inert fixtures, contain no real
 malware and use only RFC 5737 documentation addresses and `.test` hostnames.
 
 ## Licence
