@@ -48,7 +48,7 @@ class EmulationReport:
     files: dict = field(default_factory=dict)       # path -> bytes the sample wrote
     file_modes: dict = field(default_factory=dict)  # path -> last chmod mode
     stdout: bytes = b""
-    sent: list = field(default_factory=list)
+    sent: list = field(default_factory=list)  # one conversation per socket: [{proto, ip, port, messages: [[bytes, repeats]...], total_bytes}]
     received: list = field(default_factory=list)  # bytes a relayed remote end sent back
     syscall_counts: dict = field(default_factory=dict)
     unknown_syscalls: dict = field(default_factory=dict)

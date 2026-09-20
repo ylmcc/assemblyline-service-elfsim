@@ -78,6 +78,11 @@ class Prog:
         self.code += b"\xe9\0\0\0\0"
         self.fixups.append((len(self.code) - 4, name))
 
+    def loop_dec(self, counter_addr: int, name: str) -> None:
+        """dec dword [counter_addr]; jnz name  (a guest-side loop without unrolling code)."""
+        self.code += b"\xff\x0d" + struct.pack("<I", counter_addr) + b"\x0f\x85\0\0\0\0"
+        self.fixups.append((len(self.code) - 4, name))
+
     def jnz(self, name: str) -> None:
         self.code += b"\x85\xc0\x0f\x85\0\0\0\0"  # test eax,eax ; jnz rel32
         self.fixups.append((len(self.code) - 4, name))
@@ -87,6 +92,7 @@ class Prog:
 
     # -- output -------------------------------------------------------------
     def build(self, machine: int = 3) -> bytes:
+        assert len(self.code) <= DATA_OFF - CODE_OFF, "code overflows into the data area"
         for pos, name in self.fixups:
             target = self.labels[name]
             after = BASE + CODE_OFF + pos + 4

@@ -23,6 +23,8 @@ MMAP_BASE = 0x40000000
 MAX_EVENTS = 5000
 MAX_SENT_ENTRIES = 200
 MAX_SENT_BYTES = 256 * 1024
+MAX_MESSAGES_PER_CONVERSATION = 60
+MAX_MESSAGE_BYTES = 2048
 MAX_STDOUT = 64 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_FILES = 50
@@ -113,6 +115,7 @@ class Sock:
     remote: Optional[dict] = None
     recv_queue: deque = field(default_factory=deque)
     relay: Optional[object] = None  # RelaySession when this stream is relayed to a real endpoint
+    conversation: Optional[dict] = None  # ordered record of what was sent on this socket
 
 
 @dataclass
@@ -978,16 +981,34 @@ class FakeKernel:
         if dest and "ip" in dest:
             self.network.append({"op": "sendto", "proto": proto, **dest})
             self.log("network", "sendto", proto=proto, **dest, bytes=len(data))
-        if len(self.sent) < MAX_SENT_ENTRIES and self._sent_bytes < MAX_SENT_BYTES:
-            keep = data[:2048]
-            self._sent_bytes += len(keep)
-            self.sent.append({"proto": proto, "ip": remote.get("ip"), "port": remote.get("port"),
-                              "size": len(data), "data": keep})
+        self._record_sent(sock, proto, remote, data)
         if sock.relay is not None and dest is None:
             return len(data) if sock.relay.send(data) >= 0 else -EPIPE
         if proto == "udp" and remote.get("port") == 53:
             self._answer_dns(sock, data)
         return len(data)
+
+    def _record_sent(self, sock: Sock, proto: str, remote: dict, data: bytes) -> None:
+        """Keep what a socket sent as one ordered conversation. Consecutive identical writes are
+        collapsed into a repeat count, so a heartbeat loop cannot push the interesting first
+        messages (e.g. a C2 registration) out of the record."""
+        ip, port = remote.get("ip"), remote.get("port")
+        conv = sock.conversation
+        if conv is None or (conv["ip"], conv["port"]) != (ip, port):
+            if len(self.sent) >= MAX_SENT_ENTRIES:
+                return
+            conv = {"proto": proto, "ip": ip, "port": port, "messages": [], "total_bytes": 0}
+            sock.conversation = conv
+            self.sent.append(conv)
+        conv["total_bytes"] += len(data)
+        chunk = bytes(data[:MAX_MESSAGE_BYTES])
+        messages = conv["messages"]
+        if messages and messages[-1][0] == chunk:
+            messages[-1][1] += 1
+        elif (len(messages) < MAX_MESSAGES_PER_CONVERSATION
+              and self._sent_bytes + len(chunk) <= MAX_SENT_BYTES):
+            self._sent_bytes += len(chunk)
+            messages.append([chunk, 1])
 
     def _answer_dns(self, sock: Sock, query: bytes) -> None:
         parsed = _parse_dns_query(query)

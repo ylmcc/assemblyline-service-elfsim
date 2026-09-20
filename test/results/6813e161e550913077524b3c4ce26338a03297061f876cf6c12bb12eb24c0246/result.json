@@ -133,29 +133,9 @@
       },
       {
         "auto_collapse": false,
-        "body": [
-          {
-            "bytes": 8,
-            "destination": "tcp://198.51.100.7:4444",
-            "preview": "48454c4c4f2d4332  |HELLO-C2|",
-            "times": 1
-          },
-          {
-            "bytes": 25,
-            "destination": "udp://203.0.113.53:53",
-            "preview": "42420100000100000000000002633204746573740000010001  |BB...........c2.test.....|",
-            "times": 1
-          }
-        ],
-        "body_config": {
-          "column_order": [
-            "destination",
-            "bytes",
-            "times",
-            "preview"
-          ]
-        },
-        "body_format": "TABLE",
+        "body": "-> tcp://198.51.100.7:4444\n    HELLO-C2\n    readable text: \"HELLO-C2\"\n\n-> udp://203.0.113.53:53\n    BB\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x02c2\\x04test\\x00\\x00\\x01\\x00\\x01\n    readable text: \"test\"",
+        "body_config": {},
+        "body_format": "TEXT",
         "classification": "TLP:C",
         "depth": 0,
         "heuristic": {
@@ -170,7 +150,7 @@
         },
         "promote_to": null,
         "tags": {},
-        "title_text": "Data the sample sent (first bytes; hex | ascii)",
+        "title_text": "What the sample sent (control bytes shown as \\xNN)",
         "zeroize_on_tag_safe": false
       },
       {
@@ -284,7 +264,7 @@
     "supplementary": [
       {
         "name": "elfsim_report.json",
-        "sha256": "d4f2103cd20e056f6d274e4966c29aaac95ae89bf80baea43e4606467ea8dc30"
+        "sha256": "e3012ecebe176d230e235abb05d6e962ac82b7e22586a9bacd8077f53f07835b"
       }
     ]
   },

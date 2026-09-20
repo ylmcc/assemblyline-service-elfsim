@@ -22,8 +22,11 @@ from assemblyline_v4_service.common.result import (
 from assemblyline_v4_service.common.task import PARENT_RELATION
 
 from elfsim_service.emulator import UnsupportedElf, emulate
+from elfsim_service.textview import readable, text_runs
 
 MAX_ROWS = 30
+MAX_CONVERSATIONS = 8
+MAX_TRANSCRIPT_LINES = 25
 MAX_EXTRACTED = 10
 RECONNECT_THRESHOLD = 5
 _LOCAL_NETS = [ipaddress.ip_network(n) for n in
@@ -47,9 +50,25 @@ def _is_local(ip: str) -> bool:
             or any(addr in n for n in _LOCAL_NETS if n.version == addr.version))
 
 
-def _preview(data: bytes, limit: int = 48) -> str:
-    text = "".join(chr(b) if 32 <= b < 127 else "." for b in data[:limit])
-    return f"{data[:limit].hex()}  |{text}|"
+def _transcript(proto: str, messages: tuple, reps: list) -> list:
+    """Readable lines for one conversation. TCP is a byte stream with no message boundaries, so
+    adjacent one-off sends read as a single stream; UDP datagrams stay separate. Repeated sends
+    (heartbeats) become one line with a count or range."""
+    lines, pending = [], b""
+    for (data, _), (low, high) in zip(messages, reps):
+        if high == 1:
+            if proto == "tcp":
+                pending += data
+                continue
+            lines.append(readable(data))
+            continue
+        if pending:
+            lines.append(readable(pending))
+            pending = b""
+        lines.append(f"{readable(data)}    x{low if low == high else f'{low}-{high}'}")
+    if pending:
+        lines.append(readable(pending))
+    return lines[:MAX_TRANSCRIPT_LINES]
 
 
 class ElfSim(ServiceBase):
@@ -162,18 +181,39 @@ class ElfSim(ServiceBase):
         result.add_section(table)
 
     def _sent_data(self, result: Result, report) -> None:
-        sends: Counter = Counter()
-        for s in report.sent:
-            if s["proto"] != "netlink" and s["ip"]:
-                sends[(s["proto"], s["ip"], s["port"], s["data"])] += 1
-        if not sends:
+        """A readable transcript of what the sample sent, one entry per distinct conversation
+        (a bot that reconnects 76 times with the same registration shows up once, x76)."""
+        groups: dict = {}
+        for conv in report.sent:
+            if conv["proto"] == "netlink" or not conv["ip"]:
+                continue
+            # Group on *what* was sent; a repeat count of 2+ (heartbeats) only widens a range,
+            # so a session cut short doesn't split an otherwise identical conversation.
+            key = (conv["proto"], conv["ip"], conv["port"],
+                   tuple((bytes(m), 1 if n == 1 else 2) for m, n in conv["messages"]))
+            group = groups.setdefault(key, {"connections": 0, "reps": [[n, n] for _, n in conv["messages"]]})
+            group["connections"] += 1
+            for span, (_, n) in zip(group["reps"], conv["messages"]):
+                span[0], span[1] = min(span[0], n), max(span[1], n)
+        if not groups:
             return
-        table = ResultTableSection("Data the sample sent (first bytes; hex | ascii)")
-        for (proto, ip, port, data), count in sends.most_common(MAX_ROWS):
-            table.add_row(TableRow(destination=f"{proto}://{ip}:{port}", bytes=len(data),
-                                   times=count, preview=_preview(data)))
-        table.set_heuristic(4, signature="data_sent")
-        result.add_section(table)
+
+        blocks = []
+        for (proto, ip, port, messages), group in sorted(
+                groups.items(), key=lambda kv: -kv[1]["connections"])[:MAX_CONVERSATIONS]:
+            title = f"-> {proto}://{ip}:{port}"
+            if group["connections"] > 1:
+                title += f"   (identical in {group['connections']} connections)"
+            lines = [title] + ["    " + l for l in _transcript(proto, messages, group["reps"])]
+            words = text_runs(b"".join(m for m, _ in messages))
+            if words:
+                lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
+            blocks.append("\n".join(lines))
+
+        section = ResultSection(
+            "What the sample sent (control bytes shown as \\xNN)", body="\n\n".join(blocks))
+        section.set_heuristic(4, signature="data_sent")
+        result.add_section(section)
 
     def _processes(self, result: Result, report, argv: list) -> None:
         rows: Counter = Counter()
@@ -293,7 +333,10 @@ class ElfSim(ServiceBase):
             "unimplemented_syscalls": report.unknown_syscalls,
             "events": report.events, "events_dropped": report.events_dropped,
             "network": report.network,
-            "sent": [{**s, "data": s["data"].hex()} for s in report.sent],
+            "sent": [{"proto": c["proto"], "ip": c["ip"], "port": c["port"],
+                      "total_bytes": c["total_bytes"],
+                      "messages": [{"text": readable(m, 2048), "hex": m.hex(), "times": n}
+                                   for m, n in c["messages"]]} for c in report.sent],
             "stdout": report.stdout.decode("latin-1"),
             "files": {p: len(c) for p, c in report.files.items()},
         }

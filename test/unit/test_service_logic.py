@@ -124,3 +124,58 @@ def test_unsupported_elf_produces_no_result_sections():
     req = Req()
     ElfSim().execute(req)
     assert req.result.sections == []
+
+
+# ---- readable transcript of what was sent ----------------------------------
+def _conv(messages, ip="198.51.100.7", port=4444, proto="tcp"):
+    return {"proto": proto, "ip": ip, "port": port, "messages": messages,
+            "total_bytes": sum(len(m) * n for m, n in messages)}
+
+
+BOT_REGISTRATION = [[b"\x00\x00\x00\x01", 1], [b"\x04px86", 1], [b"\x03x86", 1], [b"\x00\x00", 95]]
+
+
+def test_sent_data_is_a_readable_transcript_not_hex():
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv(BOT_REGISTRATION)]))
+    body = section.body
+    assert "-> tcp://198.51.100.7:4444" in body
+    assert "\\x00\\x00\\x00\\x01" in body and "\\x04px86" in body and "\\x03x86" in body
+    assert "\\x00\\x00    x95" in body                      # repeats collapsed, not 95 rows
+    assert 'readable text: "px86", "x86"' in body
+    assert "000000" not in body.replace("\\x00", "")      # no hex dump anywhere
+    assert _score_of(section) == 0
+
+
+def test_identical_reconnects_are_reported_once_with_a_count():
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv(BOT_REGISTRATION)] * 76))
+    assert section.body.count("-> tcp://") == 1
+    assert "identical in 76 connections" in section.body
+
+
+def test_different_conversations_are_kept_separate():
+    convs = [_conv(BOT_REGISTRATION), _conv([[b"GET / HTTP/1.1\r\n", 1]], ip="203.0.113.9", port=80)]
+    (section,) = _sections(ElfSim._sent_data, _report(sent=convs))
+    assert "tcp://198.51.100.7:4444" in section.body and "tcp://203.0.113.9:80" in section.body
+    assert "GET / HTTP/1.1\\r\\n" in section.body
+
+
+def test_netlink_and_addressless_sends_are_not_reported():
+    convs = [_conv([[b"\x28\x00", 1]], ip=None, port=None, proto="netlink")]
+    assert _sections(ElfSim._sent_data, _report(sent=convs)) == []
+
+
+def test_tcp_sends_read_as_one_stream_but_udp_datagrams_stay_separate():
+    tcp = _conv([[b"\x00\x00\x00\x01", 1], [b"\x04", 1], [b"px86", 1], [b"\x00\x00", 5]])
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[tcp]))
+    assert "    \\x00\\x00\\x00\\x01\\x04px86\n" in section.body        # one stream line
+    udp = _conv([[b"one", 1], [b"two", 1]], proto="udp", port=9999)
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[udp]))
+    assert "    one\n    two" in section.body                                # datagrams kept apart
+
+
+def test_a_session_cut_short_does_not_split_identical_conversations():
+    full = _conv([[b"\x04px86", 1], [b"\x00\x00", 120]])
+    short = _conv([[b"\x04px86", 1], [b"\x00\x00", 90]])
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[full] * 3 + [short]))
+    assert section.body.count("-> tcp://") == 1
+    assert "identical in 4 connections" in section.body and "x90-120" in section.body
