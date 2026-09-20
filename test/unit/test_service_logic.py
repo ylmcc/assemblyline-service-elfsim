@@ -109,23 +109,6 @@ def test_dns_lookup_is_informational_but_tagged():
     assert any(t == "c2.test" for tags in section.tags.values() for t in tags)
 
 
-# ---- unsupported input is silent -----------------------------------------
-def test_unsupported_elf_produces_no_result_sections():
-    p = Prog()
-    p.exit(0)
-    blob = p.build(machine=8)   # EM_MIPS: not emulated yet
-
-    class Req:
-        file_contents = blob
-        result = None
-        def get_param(self, name):
-            return {"arguments": "", "max_instructions": 1000,
-                    "emulation_timeout_seconds": 5, "max_syscalls": 1000}[name]
-    req = Req()
-    ElfSim().execute(req)
-    assert req.result.sections == []
-
-
 # ---- readable transcript of what was sent ----------------------------------
 def _conv(messages, ip="198.51.100.7", port=4444, proto="tcp"):
     return {"proto": proto, "ip": ip, "port": port, "messages": messages,
@@ -179,3 +162,59 @@ def test_a_session_cut_short_does_not_split_identical_conversations():
     (section,) = _sections(ElfSim._sent_data, _report(sent=[full] * 3 + [short]))
     assert section.body.count("-> tcp://") == 1
     assert "identical in 4 connections" in section.body and "x90-120" in section.body
+
+
+# ---- unsupported files explain themselves quietly ---------------------------
+def test_unsupported_file_gets_a_collapsed_explanation_with_no_heuristic():
+    p = Prog()
+    p.exit(0)
+    blob = p.build(machine=40)   # EM_ARM
+
+    class Req:
+        file_contents = blob
+        result = None
+
+        def get_param(self, name):
+            return {"arguments": "", "max_instructions": 1000,
+                    "emulation_timeout_seconds": 5, "max_syscalls": 1000}[name]
+    req = Req()
+    ElfSim().execute(req)
+    (section,) = req.result.sections
+    assert "unsupported machine" in section.body and section.heuristic is None
+    assert section.auto_collapse is True
+
+
+def test_mips_sample_is_emulated_end_to_end_through_the_service():
+    from test.unit.mipsbuilder import MipsProg
+
+    class Req:
+        result = None
+        file_contents = None
+
+        def __init__(self, data):
+            self.file_contents = data
+            self.supp = []
+
+        def get_param(self, name):
+            return {"arguments": "", "max_instructions": 1_000_000,
+                    "emulation_timeout_seconds": 10, "max_syscalls": 10000}[name]
+
+        def add_supplementary(self, *a, **k):
+            self.supp.append(a[1])
+            return True
+
+    m = MipsProg()
+    addr = m.d(MipsProg.sockaddr_in("198.51.100.7", 4444))
+    m.call("socket", 2, 2, 0)
+    m.fd_from_result()
+    m.li(5, addr); m.li(6, 16)
+    m.call_keep_args("connect")
+    m.exit(0)
+    req = Req(m.build())
+
+    class Svc(ElfSim):
+        working_directory = "/tmp"
+    Svc().execute(req)
+    titles = [s.title_text for s in req.result.sections]
+    assert titles[0] == "Emulation summary" and any(t.startswith("Network connections") for t in titles)
+    assert req.supp == ["elfsim_report.json"]

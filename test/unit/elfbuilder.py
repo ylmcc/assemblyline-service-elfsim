@@ -91,7 +91,7 @@ class Prog:
         self.sys(1, code)
 
     # -- output -------------------------------------------------------------
-    def build(self, machine: int = 3) -> bytes:
+    def build(self, machine: int = 3, flags: int = 0) -> bytes:
         assert len(self.code) <= DATA_OFF - CODE_OFF, "code overflows into the data area"
         for pos, name in self.fixups:
             target = self.labels[name]
@@ -101,7 +101,7 @@ class Prog:
         blob[CODE_OFF:CODE_OFF + len(self.code)] = self.code
         blob[DATA_OFF:] = self.data
         ehdr = (b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\0" * 8
-                + struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, BASE + CODE_OFF, 52, 0, 0,
+                + struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, BASE + CODE_OFF, 52, 0, flags,
                               52, 32, 1, 0, 0, 0))
         phdr = struct.pack("<8I", 1, 0, BASE, BASE, len(blob), len(blob) + 0x2000, 7, 0x1000)
         blob[0:52] = ehdr

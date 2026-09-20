@@ -232,6 +232,13 @@ class FakeKernel:
         uc, arch = self.uc, self.arch
         nr = uc.reg_read(arch.nr_reg)
         args = [uc.reg_read(r) for r in arch.arg_regs]
+        if arch.stack_arg_offset is not None:  # e.g. MIPS o32: args 5 and 6 are on the stack
+            sp = uc.reg_read(arch.sp_reg)
+            for i in range(6 - len(args)):
+                try:
+                    args.append(self.u32(sp + arch.stack_arg_offset + 4 * i))
+                except Fault:
+                    args.append(0)
         name = arch.syscalls.get(nr, f"sys_{nr}")
 
         self.syscall_count += 1
@@ -260,6 +267,22 @@ class FakeKernel:
             except Exception as e:  # a handler bug must not take down the whole analysis
                 ret = -ENOSYS
                 self.log("system", name, note=f"internal error in handler: {type(e).__name__}: {e}")
+        self._set_result(ret)
+
+    def _set_result(self, ret: int) -> None:
+        """Deliver a syscall result in the arch's convention. Handlers return a value or
+        -errno using i386 errno numbers; other ABIs get their own numbers and error flag."""
+        arch, uc = self.arch, self.uc
+        if ret < 0:
+            errno = arch.errno_map.get(-ret, -ret)
+            if arch.error_flag_reg is not None:   # MIPS: $a3 = 1, $v0 = positive errno
+                uc.reg_write(arch.error_flag_reg, 1)
+                uc.reg_write(arch.ret_reg, errno)
+            else:                                  # i386: -errno in the result register
+                uc.reg_write(arch.ret_reg, -errno & 0xFFFFFFFF)
+            return
+        if arch.error_flag_reg is not None:
+            uc.reg_write(arch.error_flag_reg, 0)
         uc.reg_write(arch.ret_reg, ret & 0xFFFFFFFF)
 
     def _stop(self, reason: str) -> None:
@@ -298,7 +321,7 @@ class FakeKernel:
         self.brk_cur, self.brk_mapped_end = snap["brk_cur"], snap["brk_mapped_end"]
         self.mmap_next, self.mapped_bytes, self.cwd = snap["mmap_next"], snap["mapped_bytes"], snap["cwd"]
         self.uc.context_restore(record["ctx"])
-        self.uc.reg_write(self.arch.ret_reg, record["pid"])
+        self._set_result(record["pid"])
         self.path_syscalls = 0
         return self.uc.reg_read(self.arch.pc_reg)
 
@@ -391,6 +414,7 @@ class FakeKernel:
         return 0
 
     sys_getuid32 = sys_getgid32 = sys_geteuid32 = sys_getegid32 = sys_getuid
+    sys_getgid = sys_geteuid = sys_getegid = sys_getuid
 
     def sys_setsid(self, *_):
         self.log("process", "setsid")
@@ -514,7 +538,7 @@ class FakeKernel:
                 return -ENOMEM
             base = self.mmap_next
             self.mmap_next += size
-        if not flags & MAP_ANONYMOUS and s32(fd) != -1:
+        if not flags & self.arch.map_anonymous and s32(fd) != -1:
             obj = self.fds.get(s32(fd))
             if isinstance(obj, OpenFile):
                 self.write(base, bytes(obj.data[offset:offset + length]))
@@ -527,10 +551,11 @@ class FakeKernel:
     def sys_mmap2(self, addr, length, prot, flags, fd, pgoff):
         return self._sys_mmap(addr, length, prot, flags, fd, pgoff * PAGE)
 
-    def sys_mmap(self, ptr, *_):
-        # old i386 mmap(): a single pointer to an argument block
-        a = struct.unpack("<6I", self.read(ptr, 24))
-        return self._sys_mmap(*a)
+    def sys_mmap(self, a0, a1, a2, a3, a4, a5):
+        if self.arch.old_mmap_struct:
+            # old i386 mmap(): a single pointer to an argument block
+            return self._sys_mmap(*struct.unpack("<6I", self.read(a0, 24)))
+        return self._sys_mmap(a0, a1, a2, a3, a4, a5)      # other ABIs: ordinary arguments
 
     def sys_munmap(self, addr, length, *_):
         try:
@@ -552,7 +577,7 @@ class FakeKernel:
         return n
 
     def sys_uname(self, buf, *_):
-        fields = [b"Linux", b"localhost", b"3.2.0", b"#1 SMP", b"i686", b"(none)"]
+        fields = [b"Linux", b"localhost", b"3.2.0", b"#1 SMP", self.arch.uname_machine.encode(), b"(none)"]
         self.write(buf, b"".join(f.ljust(65, b"\0") for f in fields))
         return 0
 
@@ -588,8 +613,11 @@ class FakeKernel:
 
     sys_fcntl64 = sys_fcntl
 
-    def sys_set_thread_area(self, *_):
-        return -ENOSYS  # TLS setup: only needed if a real sample proves it necessary
+    def sys_set_thread_area(self, addr, *_):
+        if self.arch.set_tls is None:
+            return -ENOSYS  # x86 needs a GDT/segment setup we don't emulate; a real sample would fault
+        self.arch.set_tls(self.uc, addr)
+        return 0
 
     # ---------------------------------------------------------------- files
     def _norm(self, path: str) -> str:
@@ -613,17 +641,17 @@ class FakeKernel:
                 self._missing_seen.add(path)
                 self.log("file", "open", path=path, note="special file opened", flags=oct(flags))
             return self._alloc_fd(Device("special"))
-        writing = flags & (O_WRONLY | O_RDWR) or flags & O_CREAT
+        writing = flags & (O_WRONLY | O_RDWR) or flags & self.arch.o_creat
         if path in self.files or writing:
             if path not in self.files:
                 if len(self.files) >= MAX_FILES:
                     return -ENOMEM
                 self.files[path] = bytearray()
                 self.log("file", "open", path=path, note="created", flags=oct(flags))
-            elif flags & O_TRUNC:
+            elif flags & self.arch.o_trunc:
                 self.files[path] = bytearray()
             content = self.files[path]
-            return self._alloc_fd(OpenFile(path, flags, content, len(content) if flags & O_APPEND else 0))
+            return self._alloc_fd(OpenFile(path, flags, content, len(content) if flags & self.arch.o_append else 0))
         if path not in self._missing_seen and len(self._missing_seen) < 200:
             self._missing_seen.add(path)
             self.log("file", "open", path=path, note="probed, does not exist")
@@ -636,7 +664,7 @@ class FakeKernel:
         return self._open(self.cstr(path), flags)
 
     def sys_creat(self, path, mode, *_):
-        return self._open(self.cstr(path), O_CREAT | O_WRONLY | O_TRUNC)
+        return self._open(self.cstr(path), self.arch.o_creat | O_WRONLY | self.arch.o_trunc)
 
     def sys_close(self, fd, *_):
         return 0 if self.fds.pop(s32(fd), None) is not None else -EBADF
@@ -794,14 +822,11 @@ class FakeKernel:
         return -ENOENT
 
     def _fill_stat(self, buf: int, mode: int, size: int, is64: bool) -> None:
-        if is64:  # i386 struct stat64, 96 bytes
-            raw = bytearray(96)
-            struct.pack_into("<I", raw, 16, mode)
-            struct.pack_into("<Q", raw, 44, size)
-        else:     # old i386 struct stat, 64 bytes
-            raw = bytearray(64)
-            struct.pack_into("<H", raw, 8, mode & 0xFFFF)
-            struct.pack_into("<I", raw, 20, size)
+        mode_off, mode_bytes, size_off, total = self.arch.stat64 if is64 else self.arch.stat32
+        raw = bytearray(total)
+        struct.pack_into("<I" if mode_bytes == 4 else "<H", raw, mode_off,
+                         mode if mode_bytes == 4 else mode & 0xFFFF)
+        struct.pack_into("<Q" if is64 else "<I", raw, size_off, size)
         self.write(buf, bytes(raw))
 
     def _stat_path(self, path_ptr: int, buf: int, is64: bool) -> int:
@@ -870,7 +895,11 @@ class FakeKernel:
 
     def sys_pipe(self, ptr, *_):
         pipe = Pipe(bytearray())
-        self.write(ptr, struct.pack("<II", self._alloc_fd(pipe), self._alloc_fd(pipe)))
+        first, second = self._alloc_fd(pipe), self._alloc_fd(pipe)
+        if self.arch.pipe_second_reg is not None:   # MIPS: fds come back in $v0/$v1, no pointer
+            self.uc.reg_write(self.arch.pipe_second_reg, second)
+            return first
+        self.write(ptr, struct.pack("<II", first, second))
         return 0
 
     # ---------------------------------------------------------------- sockets
@@ -902,6 +931,7 @@ class FakeKernel:
 
     def sys_socket(self, domain, typ, proto, *_):
         typ &= 0xF  # strip SOCK_NONBLOCK / SOCK_CLOEXEC
+        typ = self.arch.sock_type_map.get(typ, typ)  # other ABIs number SOCK_STREAM/DGRAM differently
         if domain not in (AF_UNIX, AF_INET, AF_INET6, AF_NETLINK):
             return -EAFNOSUPPORT
         fd = self._alloc_fd(Sock(domain, typ, proto))

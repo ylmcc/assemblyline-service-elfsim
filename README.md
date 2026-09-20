@@ -33,6 +33,9 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |
 | Emulation stopped on a CPU fault | faulting pc, instruction bytes and the reason |
 
+The MIPS port was validated on a real static uClibc `busybox` (echo, uname, cat, ls, sleep), not only
+synthetic fixtures.
+
 A full event log is attached as the supplementary file `elfsim_report.json`.
 
 Heuristics are deliberately quiet. Things a benign daemon also does (DNS lookups, `fork` +
@@ -58,10 +61,14 @@ starve the rest of the program. Unknown syscalls are answered `-ENOSYS` and repo
 
 ## Limitations
 
-- 32-bit little-endian **x86** only for now. Files for other CPUs, 64-bit ELFs and dynamically
-  linked binaries are skipped silently rather than reported as "not applicable".
-- ARM, MIPS, PowerPC and m68k are supported by Unicorn and would each need an entry in
-  `elfsim_service/arch.py` (register map and syscall table). SH4 is not supported by Unicorn.
+- 32-bit little-endian **x86** and **MIPS (o32)** static binaries only. Other CPUs, 64-bit ELFs,
+  big-endian MIPS, N32/MIPS16/microMIPS and dynamically linked binaries are not emulated; the
+  result carries a collapsed, unscored note saying why (no heuristic, so no noise).
+- ARM, PowerPC and m68k are supported by Unicorn and would each need an `Arch` entry in
+  `elfsim_service/arch.py` (register map, syscall table, ABI constants); big-endian MIPS needs
+  byte-order support in the fake kernel. SH4 is not supported by Unicorn.
+- Truncated files are loaded the way a kernel would (missing bytes read as zero) and the summary
+  says so. A UPX-packed sample must be complete for any unpacker to work on it.
 - Memory is snapshotted at `fork()`, but the fake filesystem and network log are shared.
 - Threads (`clone` with `CLONE_VM`) are not emulated, and TLS setup (`set_thread_area`) returns
   `-ENOSYS`; a sample that needs either stops with a fault and says so.

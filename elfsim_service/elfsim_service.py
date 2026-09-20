@@ -92,6 +92,10 @@ class ElfSim(ServiceBase):
             # Not something we can emulate (other CPU, dynamic linking...). Silent on purpose:
             # this would fire on a large share of accepted files and isn't actionable.
             self.log.info(f"ElfSim skipping sample: {e}")
+            # A collapsed note with no heuristic (so no score and no noise) that answers "why
+            # didn't it run?" without anyone needing the pod logs.
+            result.add_section(ResultSection("ElfSim did not emulate this file", body=str(e),
+                                             auto_collapse=True))
             request.result = result
             return
 
@@ -120,6 +124,8 @@ class ElfSim(ServiceBase):
             section.set_item("idle_forked_paths_abandoned", abandoned)
         if report.unknown_syscalls:
             section.set_item("unimplemented_syscalls", ", ".join(sorted(report.unknown_syscalls)))
+        for i, note in enumerate(report.warnings, 1):
+            section.set_item(f"note_{i}" if len(report.warnings) > 1 else "note", note)
         section.set_item("runtime_seconds", round(report.elapsed, 2))
         section.set_heuristic(1, signature="emulation_completed")
         result.add_section(section)
@@ -318,8 +324,12 @@ class ElfSim(ServiceBase):
         body = f"{err.get('type', 'unknown error')} at pc={err.get('pc', '?')}"
         if err.get("bytes_at_pc"):
             body += f" (bytes at pc: {err['bytes_at_pc']})"
-        body += (f"\nEmulation stopped after {report.syscalls_total} syscalls. This usually means "
-                 "an unsupported instruction, TLS/thread setup, or a packed/self-modifying sample.")
+        if report.warnings:
+            cause = next((w for w in report.warnings if "truncated" in w), report.warnings[0])
+            body += "\nLikely cause: " + cause
+        else:
+            body += (f"\nEmulation stopped after {report.syscalls_total} syscalls. This usually means "
+                     "an unsupported instruction, TLS/thread setup, or a packed/self-modifying sample.")
         section = ResultSection("Emulation stopped on a CPU fault", body=body)
         section.set_heuristic(7, signature=err.get("type", "fault").replace(" ", "_"))
         result.add_section(section)

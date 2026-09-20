@@ -7,7 +7,8 @@ description: >
   network, filesystem or process behind it. Reports what the sample tried to do -- C2
   connections and registration data, DNS lookups, files dropped, fork/exec, process
   renaming -- which static analysis cannot recover from stripped, statically linked bots.
-  Currently emulates x86 (i386); other CPU architectures are skipped silently.
+  Emulates 32-bit x86 and little-endian MIPS (o32) static binaries. Other CPU types, 64-bit,
+  big-endian and dynamically linked files are not emulated; a collapsed note says why.
 
 accepts: executable/linux/elf32
 rejects: empty|metadata/.*
