@@ -170,6 +170,7 @@ class FakeKernel:
         self.brk_start = self.brk_cur = self.brk_mapped_end = _align_up(brk_base)
         self.mmap_next = MMAP_BASE
         self.mapped_bytes = 0
+        self.reserved: list = []   # [start, end) PROT_NONE address-space reservations: no memory behind them
 
     # ---------------------------------------------------------------- plumbing
     def log(self, kind: str, name: str, **detail) -> None:
@@ -205,6 +206,37 @@ class FakeKernel:
     def put32(self, addr: int, value: int) -> None:
         self.write(addr, struct.pack("<I", value & 0xFFFFFFFF))
 
+    # ---- word-size-aware access: 32- and 64-bit ABIs share every code path that uses these
+    @property
+    def _wfmt(self) -> str:
+        return "Q" if self.arch.word_size == 8 else "I"
+
+    def read_words(self, addr: int, n: int) -> tuple:
+        return struct.unpack(f"<{n}{self._wfmt}", self.read(addr, n * self.arch.word_size))
+
+    def pack_words(self, *values: int) -> bytes:
+        mask = (1 << (self.arch.word_size * 8)) - 1
+        return struct.pack(f"<{len(values)}{self._wfmt}", *(v & mask for v in values))
+
+    def uptr(self, addr: int) -> int:
+        """Read one pointer-sized value."""
+        return self.read_words(addr, 1)[0]
+
+    def put_uptr(self, addr: int, value: int) -> None:
+        self.write(addr, self.pack_words(value))
+
+    def _iovec(self, base: int, index: int) -> tuple:
+        """(buffer address, length) of the index-th struct iovec (8 bytes on 32-bit, 16 on 64-bit)."""
+        return self.read_words(base + 2 * self.arch.word_size * index, 2)
+
+    def _read_timeval(self, addr: int) -> float:
+        sec, usec = self.read_words(addr, 2)
+        return sec + usec / 1e6
+
+    def _read_timespec(self, addr: int) -> float:
+        sec, nsec = self.read_words(addr, 2)
+        return sec + nsec / 1e9
+
     def now(self) -> float:
         return self.epoch + self.vtime
 
@@ -225,6 +257,67 @@ class FakeKernel:
             return False
         self.mapped_bytes += size
         return True
+
+    # ---- address space: committed memory lives in Unicorn; PROT_NONE mmaps are only reserved here.
+    # Runtimes such as Go reserve hundreds of GiB of address space up front and commit pieces
+    # later, exactly as a real kernel lets them: a reservation costs nothing.
+    def _mapped_ranges(self) -> list:
+        return [(b, e + 1) for b, e, _ in self.uc.mem_regions()]
+
+    def _blocker(self, addr: int, size: int) -> Optional[int]:
+        """End of the first mapped/reserved range overlapping [addr, addr+size), else None."""
+        end = addr + size
+        ends = [e for s, e in self._mapped_ranges() + [tuple(r) for r in self.reserved] if s < end and addr < e]
+        return max(ends) if ends else None
+
+    def _reserve(self, addr: int, size: int) -> None:
+        self.reserved.append([addr, addr + size])
+
+    def _unreserve(self, addr: int, size: int) -> None:
+        end, kept = addr + size, []
+        for s, e in self.reserved:
+            if e <= addr or s >= end:
+                kept.append([s, e])
+                continue
+            if s < addr:
+                kept.append([s, addr])
+            if e > end:
+                kept.append([end, e])
+        self.reserved = kept
+
+    def _unmap_range(self, addr: int, size: int) -> None:
+        """Drop whatever is mapped or reserved in [addr, addr+size); partial overlaps are fine."""
+        end = addr + size
+        self._unreserve(addr, size)
+        for s, e in self._mapped_ranges():
+            lo, hi = max(s, addr), min(e, end)
+            if lo < hi:
+                try:
+                    self.uc.mem_unmap(lo, hi - lo)
+                    self.mapped_bytes = max(0, self.mapped_bytes - (hi - lo))
+                except UcError:
+                    pass
+
+    def _commit_reserved(self, addr: int, size: int) -> bool:
+        """mprotect() making reserved pages accessible: back them with real memory now."""
+        end = addr + size
+        for s, e in [tuple(r) for r in self.reserved]:
+            lo, hi = max(s, addr), min(e, end)
+            if lo < hi:
+                self._unreserve(lo, hi - lo)
+                if not self._map(lo, hi - lo):
+                    return False
+        return True
+
+    def _pick_address(self, size: int) -> Optional[int]:
+        cand = self.mmap_next
+        while cand + size < self.stack_low:
+            blocked = self._blocker(cand, size)
+            if blocked is None:
+                self.mmap_next = cand + size
+                return cand
+            cand = _align_up(blocked)
+        return None
 
     # ---------------------------------------------------------------- dispatch
     def handle(self) -> None:
@@ -273,17 +366,18 @@ class FakeKernel:
         """Deliver a syscall result in the arch's convention. Handlers return a value or
         -errno using i386 errno numbers; other ABIs get their own numbers and error flag."""
         arch, uc = self.arch, self.uc
+        mask = (1 << (arch.word_size * 8)) - 1
         if ret < 0:
             errno = arch.errno_map.get(-ret, -ret)
             if arch.error_flag_reg is not None:   # MIPS: $a3 = 1, $v0 = positive errno
                 uc.reg_write(arch.error_flag_reg, 1)
                 uc.reg_write(arch.ret_reg, errno)
             else:                                  # i386: -errno in the result register
-                uc.reg_write(arch.ret_reg, -errno & 0xFFFFFFFF)
+                uc.reg_write(arch.ret_reg, -errno & mask)
             return
         if arch.error_flag_reg is not None:
             uc.reg_write(arch.error_flag_reg, 0)
-        uc.reg_write(arch.ret_reg, ret & 0xFFFFFFFF)
+        uc.reg_write(arch.ret_reg, ret & mask)
 
     def _stop(self, reason: str) -> None:
         self.stop_reason = self.stop_reason or reason
@@ -299,7 +393,8 @@ class FakeKernel:
             regions.append((begin, size, perms, bytes(self.uc.mem_read(begin, size))))
         return {"regions": regions, "fds": dict(self.fds), "brk_cur": self.brk_cur,
                 "brk_mapped_end": self.brk_mapped_end, "mmap_next": self.mmap_next,
-                "mapped_bytes": self.mapped_bytes, "cwd": self.cwd}
+                "mapped_bytes": self.mapped_bytes, "cwd": self.cwd,
+                "reserved": [list(r) for r in self.reserved]}
 
     def rewind(self, record: dict) -> int:
         """Restore the parent's CPU/memory/fd state from a fork record; return its resume pc."""
@@ -320,6 +415,7 @@ class FakeKernel:
         self.fds = dict(snap["fds"])
         self.brk_cur, self.brk_mapped_end = snap["brk_cur"], snap["brk_mapped_end"]
         self.mmap_next, self.mapped_bytes, self.cwd = snap["mmap_next"], snap["mapped_bytes"], snap["cwd"]
+        self.reserved = [list(r) for r in snap["reserved"]]
         self.uc.context_restore(record["ctx"])
         self._set_result(record["pid"])
         self.path_syscalls = 0
@@ -381,7 +477,7 @@ class FakeKernel:
         p = self.cstr(path)
         args = []
         for i in range(64):
-            ptr = self.u32(argv + 4 * i) if argv else 0
+            ptr = self.uptr(argv + self.arch.word_size * i) if argv else 0
             if not ptr:
                 break
             args.append(self.cstr(ptr, 1024))
@@ -450,7 +546,7 @@ class FakeKernel:
 
     def sys_times(self, buf, *_):
         if buf:
-            self.write(buf, b"\0" * 16)
+            self.write(buf, b"\0" * (4 * self.arch.word_size))     # struct tms: four clock_t
         return int(self.vtime * 100) & 0x7FFFFFFF
 
     def sys_inotify_init(self, *_):
@@ -485,26 +581,28 @@ class FakeKernel:
     def sys_time(self, tptr, *_):
         t = int(self.now())
         if tptr:
-            self.put32(tptr, t)
+            self.put_uptr(tptr, t)
         return t
 
     def sys_gettimeofday(self, tv, *_):
         if tv:
             sec = self.now()
-            self.write(tv, struct.pack("<II", int(sec), int((sec % 1) * 1_000_000)))
+            self.write(tv, self.pack_words(int(sec), int((sec % 1) * 1_000_000)))
         return 0
 
     def sys_clock_gettime(self, clk, ts, *_):
         if ts:
             sec = self.now()
-            self.write(ts, struct.pack("<II", int(sec), int((sec % 1) * 1e9)))
+            self.write(ts, self.pack_words(int(sec), int((sec % 1) * 1e9)))
         return 0
 
     def sys_nanosleep(self, req, *_):
         if req:
-            sec, nsec = struct.unpack("<II", self.read(req, 8))
-            self.vtime += sec + nsec / 1e9
+            self.vtime += self._read_timespec(req)
         return 0
+
+    def sys_clock_nanosleep(self, clock, flags, req, *_):
+        return self.sys_nanosleep(req)
 
     # ---------------------------------------------------------------- memory
     def sys_brk(self, addr, *_):
@@ -523,22 +621,22 @@ class FakeKernel:
         if length == 0:
             return -EINVAL
         size = _align_up(length)
+        anonymous = bool(flags & self.arch.map_anonymous) or s32(fd) == -1
         if flags & MAP_FIXED and addr % PAGE == 0:
-            try:
-                self.uc.mem_unmap(addr, size)
-            except UcError:
-                pass
-            if not self._map(addr, size):
-                return -ENOMEM
             base = addr
+            self._unmap_range(base, size)                    # MAP_FIXED replaces what was there
+        elif addr and addr % PAGE == 0 and addr + size < self.stack_low and self._blocker(addr, size) is None:
+            base = addr                                      # honour a free hint, as Linux does
         else:
-            if self.mmap_next + size >= self.stack_low:
+            base = self._pick_address(size)
+            if base is None:
                 return -ENOMEM
-            if not self._map(self.mmap_next, size):
-                return -ENOMEM
-            base = self.mmap_next
-            self.mmap_next += size
-        if not flags & self.arch.map_anonymous and s32(fd) != -1:
+        if prot == 0 and anonymous:                          # PROT_NONE: reserve address space only
+            self._reserve(base, size)
+            return base
+        if not self._map(base, size):
+            return -ENOMEM
+        if not anonymous:
             obj = self.fds.get(s32(fd))
             if isinstance(obj, OpenFile):
                 self.write(base, bytes(obj.data[offset:offset + length]))
@@ -558,15 +656,14 @@ class FakeKernel:
         return self._sys_mmap(a0, a1, a2, a3, a4, a5)      # other ABIs: ordinary arguments
 
     def sys_munmap(self, addr, length, *_):
-        try:
-            self.uc.mem_unmap(addr & ~(PAGE - 1), _align_up(length))
-            self.mapped_bytes = max(0, self.mapped_bytes - _align_up(length))
-        except UcError:
-            pass
+        self._unmap_range(addr & ~(PAGE - 1), _align_up(length))
         return 0
 
-    def sys_mprotect(self, *_):
-        return 0  # every mapping is already RWX
+    def sys_mprotect(self, addr, length, prot, *_):
+        # Mapped memory is already RWX. Making a *reserved* range accessible commits it.
+        if prot != 0 and length and not self._commit_reserved(addr & ~(PAGE - 1), _align_up(length)):
+            return -ENOMEM
+        return 0
 
     # ---------------------------------------------------------------- misc info
     def _random(self, n: int) -> bytes:
@@ -582,12 +679,24 @@ class FakeKernel:
         return 0
 
     def sys_sysinfo(self, buf, *_):
-        self.write(buf, struct.pack("<11I", 86400, 0, 0, 0, 512 * 1024 * 1024,
-                                    256 * 1024 * 1024, 0, 0, 0, 0, 1) + b"\0" * 20)
+        w = self.arch.word_size
+        raw = bytearray(13 * w + 12 if w == 8 else 64)     # 112 bytes on 64-bit, 64 on 32-bit
+        raw[0:w] = self.pack_words(86400)                   # uptime
+        raw[4 * w:5 * w] = self.pack_words(512 * 1024 * 1024)   # totalram
+        raw[5 * w:6 * w] = self.pack_words(256 * 1024 * 1024)   # freeram
+        struct.pack_into("<H", raw, 10 * w, 1)              # procs
+        struct.pack_into("<I", raw, 13 * w, 1)              # mem_unit
+        self.write(buf, bytes(raw))
         return 0
 
     def sys_getrlimit(self, res, buf, *_):
-        self.write(buf, struct.pack("<II", 0x7FFFFFFF, 0x7FFFFFFF))
+        self.write(buf, self.pack_words(0x7FFFFFFF, 0x7FFFFFFF))
+        return 0
+
+    def sys_prlimit64(self, pid, resource, new, old, *_):
+        if old:  # struct rlimit64 is two u64 on every ABI; the stack limit is a realistic 8 MiB
+            soft = 8 * 1024 * 1024 if resource == 3 else 0xFFFFFFFFFFFFFFFF
+            self.write(old, struct.pack("<QQ", soft, 0xFFFFFFFFFFFFFFFF))
         return 0
 
     sys_ugetrlimit = sys_getrlimit
@@ -608,10 +717,51 @@ class FakeKernel:
     def sys_ioctl(self, *_):
         return -ENOTTY
 
-    def sys_fcntl(self, fd, cmd, *_):
-        return 0
+    def sys_fcntl(self, fd, cmd, arg=0, *_):
+        obj = self.fds.get(s32(fd))
+        if obj is None:
+            return -EBADF
+        if cmd in (0, 1030):            # F_DUPFD / F_DUPFD_CLOEXEC: lowest free fd >= arg
+            new = max(3, s32(arg))
+            while new in self.fds:
+                new += 1
+            self.fds[new] = obj
+            return new
+        if cmd == 3:                    # F_GETFL: sockets and pipes are read/write
+            return 2 if isinstance(obj, (Sock, Pipe)) else 0
+        return 0                        # F_GETFD/F_SETFD/F_SETFL: accepted, no effect
 
     sys_fcntl64 = sys_fcntl
+
+    def sys_arch_prctl(self, code, addr, *_):
+        """x86-64 TLS: ARCH_SET_FS installs the thread pointer in the FS base register."""
+        ARCH_SET_FS, ARCH_GET_FS = 0x1002, 0x1003
+        if code == ARCH_SET_FS and self.arch.set_tls is not None:
+            self.arch.set_tls(self.uc, addr)
+            return 0
+        if code == ARCH_GET_FS:
+            from unicorn.x86_const import UC_X86_REG_FS_BASE
+            self.put_uptr(addr, self.uc.reg_read(UC_X86_REG_FS_BASE))
+            return 0
+        return -EINVAL
+
+    def sys_sigaltstack(self, *_):
+        return 0
+
+    def sys_madvise(self, *_):
+        return 0
+
+    def sys_sched_getaffinity(self, pid, length, mask, *_):
+        if length < 8:
+            return -EINVAL
+        self.write(mask, struct.pack("<Q", 1))      # one CPU, so runtimes size themselves sensibly
+        return 8
+
+    def sys_newfstatat(self, dirfd, path, buf, flags, *_):
+        """fstatat(): relative to dirfd is not modelled; an empty path with AT_EMPTY_PATH is fstat()."""
+        if flags & 0x1000 and self.cstr(path) == "":
+            return self._fstat(dirfd, buf, False)
+        return self._stat_path(path, buf, False)
 
     def sys_set_thread_area(self, addr, *_):
         if self.arch.set_tls is None:
@@ -753,7 +903,7 @@ class FakeKernel:
             return -EBADF
         total = 0
         for i in range(min(iovcnt, 64)):
-            base, length = struct.unpack("<II", self.read(iov + 8 * i, 8))
+            base, length = self._iovec(iov, i)
             r = self._write_obj(s32(fd), obj, self.read(base, min(length, 1 << 20)))
             if r < 0:
                 return r
@@ -892,6 +1042,9 @@ class FakeKernel:
             return -EBADF
         self.fds[s32(new)] = obj
         return new
+
+    def sys_pipe2(self, ptr, flags, *_):
+        return self.sys_pipe(ptr)
 
     def sys_pipe(self, ptr, *_):
         pipe = Pipe(bytearray())
@@ -1070,10 +1223,14 @@ class FakeKernel:
         sock = self.fds.get(s32(fd))
         if not isinstance(sock, Sock):
             return -EBADF
-        name, namelen, iov, iovlen = struct.unpack("<IIII", self.read(msg, 16))
+        if self.arch.word_size == 8:     # struct msghdr: name*, namelen (+pad), iov*, iovlen
+            name, namelen = self.uptr(msg), struct.unpack("<I", self.read(msg + 8, 4))[0]
+            iov, iovlen = self.uptr(msg + 16), self.uptr(msg + 24)
+        else:
+            name, namelen, iov, iovlen = struct.unpack("<IIII", self.read(msg, 16))
         data = b""
         for i in range(min(iovlen, 64)):
-            base, length = struct.unpack("<II", self.read(iov + 8 * i, 8))
+            base, length = self._iovec(iov, i)
             data += self.read(base, min(length, 1 << 20))
         return self._send(sock, data, self._parse_sockaddr(name, namelen) if name else None)
 
@@ -1133,35 +1290,43 @@ class FakeKernel:
             self.vtime += s32(timeout) / 1000
         return ready
 
-    def sys__newselect(self, n, rfds, wfds, efds, timeout, *_):
+    def _select(self, n: int, rfds: int, wfds: int, efds: int, timeout_s: Optional[float]) -> int:
+        """select(2) core. fd_set is an array of `unsigned long`, so its word width follows the ABI."""
         n = min(n, 1024)
-        nlongs = (n + 31) // 32
-        if self.relay is not None and timeout and rfds:
-            sec, usec = struct.unpack("<II", self.read(timeout, 8))
-            words = struct.unpack(f"<{nlongs}I", self.read(rfds, 4 * nlongs))
-            watch = [fd for fd in range(n) if words[fd // 32] >> (fd % 32) & 1]
-            self._relay_idle_wait(watch, sec + usec / 1e6)
+        bits = self.arch.word_size * 8
+        nwords = (n + bits - 1) // bits
+        if self.relay is not None and timeout_s is not None and rfds:
+            words = self.read_words(rfds, nwords)
+            watch = [fd for fd in range(n) if words[fd // bits] >> (fd % bits) & 1]
+            self._relay_idle_wait(watch, timeout_s)
         ready = 0
         for ptr, kind in ((rfds, "r"), (wfds, "w"), (efds, "e")):
             if not ptr:
                 continue
-            words = list(struct.unpack(f"<{nlongs}I", self.read(ptr, 4 * nlongs)))
+            words = list(self.read_words(ptr, nwords))
             for fd in range(n):
-                if not words[fd // 32] >> (fd % 32) & 1:
+                if not words[fd // bits] >> (fd % bits) & 1:
                     continue
                 keep = (kind == "w" and fd in self.fds) or (kind == "r" and self._readable(fd))
                 if keep:
                     ready += 1
                 else:
-                    words[fd // 32] &= ~(1 << (fd % 32))
-            self.write(ptr, struct.pack(f"<{nlongs}I", *words))
-        if not ready and timeout:
-            sec, usec = struct.unpack("<II", self.read(timeout, 8))
-            self.vtime += sec + usec / 1e6
+                    words[fd // bits] &= ~(1 << (fd % bits))
+            self.write(ptr, self.pack_words(*words))
+        if not ready and timeout_s is not None:
+            self.vtime += timeout_s
         return ready
 
-    def sys_select(self, ptr, *_):
-        return self.sys__newselect(*struct.unpack("<5I", self.read(ptr, 20)))
+    def sys__newselect(self, n, rfds, wfds, efds, timeout, *_):
+        return self._select(n, rfds, wfds, efds, self._read_timeval(timeout) if timeout else None)
+
+    def sys_select(self, a0, a1=0, a2=0, a3=0, a4=0, *_):
+        if self.arch.select_takes_struct:   # old i386: one pointer to the five arguments
+            a0, a1, a2, a3, a4 = self.read_words(a0, 5)
+        return self.sys__newselect(a0, a1, a2, a3, a4)
+
+    def sys_pselect6(self, n, rfds, wfds, efds, timeout, *_):
+        return self._select(n, rfds, wfds, efds, self._read_timespec(timeout) if timeout else None)
 
 
 def _align_up(v: int) -> int:

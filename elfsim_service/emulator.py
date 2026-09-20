@@ -11,7 +11,8 @@ from typing import Optional
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
-from unicorn import UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
+from unicorn import UC_HOOK_INSN, UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
+from unicorn.x86_const import UC_X86_INS_SYSCALL
 
 from elfsim_service.arch import ARCHES, Arch
 from elfsim_service.kernel import PAGE, FakeKernel
@@ -86,9 +87,10 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         arch = ARCHES.get(machine)
         if arch is None:
             raise UnsupportedElf(f"unsupported machine {machine}")
-        if elf.elfclass != 32 or not elf.little_endian:
-            raise UnsupportedElf(f"unsupported ELF variant for {machine}: only 32-bit little-endian "
-                                 "is emulated (no 64-bit or big-endian yet)")
+        if elf.elfclass != arch.elfclass or not elf.little_endian:
+            raise UnsupportedElf(f"unsupported ELF variant for {machine}: expected {arch.elfclass}-bit "
+                                 f"little-endian, got {elf.elfclass}-bit "
+                                 f"{'little' if elf.little_endian else 'big'}-endian")
         if machine == "EM_MIPS":
             flags = elf.header["e_flags"]
             if flags & 0x20:      # EF_MIPS_ABI2: the N32 ABI has a different syscall interface
@@ -103,6 +105,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         loads = [s for s in segments if s["p_type"] == "PT_LOAD"]
         entry = elf.header["e_entry"]
         phoff, phnum = elf.header["e_phoff"], elf.header["e_phnum"]
+        phentsize = elf.header["e_phentsize"]
     except (ELFError, KeyError, struct.error) as e:
         raise UnsupportedElf(f"malformed ELF: {e}")
     if not loads:
@@ -173,11 +176,12 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     auxv = [(AT_PAGESZ, PAGE), (AT_ENTRY, entry), (AT_UID, 0), (AT_EUID, 0), (AT_GID, 0),
             (AT_EGID, 0), (AT_RANDOM, rand_ptr)]
     if phdr_addr is not None:
-        auxv += [(AT_PHDR, phdr_addr), (AT_PHENT, 32), (AT_PHNUM, phnum)]
+        auxv += [(AT_PHDR, phdr_addr), (AT_PHENT, phentsize), (AT_PHNUM, phnum)]
     auxv.append((AT_NULL, 0))
     words = [len(argv)] + argv_ptrs + [0] + env_ptrs + [0] + [w for kv in auxv for w in kv]
-    sp = (sp - 4 * len(words)) & ~0xF
-    uc.mem_write(sp, struct.pack(f"<{len(words)}I", *words))
+    word_fmt = "Q" if arch.word_size == 8 else "I"          # argc/argv/envp/auxv are machine words
+    sp = (sp - arch.word_size * len(words)) & ~0xF
+    uc.mem_write(sp, struct.pack(f"<{len(words)}{word_fmt}", *words))
     uc.reg_write(arch.sp_reg, sp)
     for reg, value in arch.entry_regs.items():   # e.g. MIPS: $t9 = entry, as PIC-aware startup code expects
         uc.reg_write(reg, entry if value == "entry" else value)
@@ -195,7 +199,15 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
                               "pc": hex(uc_.reg_read(arch.pc_reg))}
             kernel._stop("interrupt")
 
-    uc.hook_add(UC_HOOK_INTR, on_interrupt)
+    if arch.syscall_hook == "insn_syscall":
+        # x86-64: the `syscall` instruction is not an interrupt, so hook the instruction itself.
+        # Unicorn resumes after it once the callback returns, exactly as for `int 0x80`.
+        def on_syscall_insn(uc_, _user):
+            kernel.handle()
+
+        uc.hook_add(UC_HOOK_INSN, on_syscall_insn, None, 1, 0, UC_X86_INS_SYSCALL)
+    else:
+        uc.hook_add(UC_HOOK_INTR, on_interrupt)
 
     # ---- run. Each emu_start segment ends on exit, execve, a limit, or a fork rewind.
     deadline = started + timeout_s

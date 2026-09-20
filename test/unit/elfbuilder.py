@@ -16,6 +16,8 @@ _ARG_REGS = (EBX, ECX, EDX, ESI, EDI, EBP)
 
 
 class Prog:
+    base = BASE          # load address; subclasses for other ABIs override it
+
     def __init__(self) -> None:
         self.code = bytearray()
         self.data = bytearray()
@@ -27,7 +29,7 @@ class Prog:
         """Place ``blob`` in the data area (4-byte aligned) and return its address."""
         while len(self.data) % 4:
             self.data.append(0)
-        addr = BASE + DATA_OFF + len(self.data)
+        addr = self.base + DATA_OFF + len(self.data)
         self.data += blob
         return addr
 
@@ -45,7 +47,7 @@ class Prog:
     # -- code ---------------------------------------------------------------
     @property
     def here(self) -> int:
-        return BASE + CODE_OFF + len(self.code)
+        return self.base + CODE_OFF + len(self.code)
 
     def raw(self, b: bytes) -> None:
         self.code += b
@@ -95,7 +97,7 @@ class Prog:
         assert len(self.code) <= DATA_OFF - CODE_OFF, "code overflows into the data area"
         for pos, name in self.fixups:
             target = self.labels[name]
-            after = BASE + CODE_OFF + pos + 4
+            after = self.base + CODE_OFF + pos + 4
             self.code[pos:pos + 4] = struct.pack("<i", target - after)
         blob = bytearray(DATA_OFF + len(self.data))
         blob[CODE_OFF:CODE_OFF + len(self.code)] = self.code

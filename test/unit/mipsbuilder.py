@@ -86,7 +86,7 @@ class MipsProg(Prog):
 
     def build(self, machine: int = 8, flags: int = 0x1000) -> bytes:
         for pos, label in self.branches:
-            after = BASE + CODE_OFF + pos + 4
+            after = self.base + CODE_OFF + pos + 4
             offset = ((self.labels[label] - after) >> 2) & 0xFFFF
             word = struct.unpack_from("<I", self.code, pos)[0] & 0xFFFF0000
             struct.pack_into("<I", self.code, pos, word | offset)

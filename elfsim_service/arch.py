@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from unicorn import UC_ARCH_MIPS, UC_ARCH_X86, UC_MODE_32, UC_MODE_LITTLE_ENDIAN, UC_MODE_MIPS32
+from unicorn import UC_ARCH_MIPS, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_MODE_LITTLE_ENDIAN, UC_MODE_MIPS32
 from unicorn.mips_const import (
     UC_MIPS_REG_A0, UC_MIPS_REG_A1, UC_MIPS_REG_A2, UC_MIPS_REG_A3, UC_MIPS_REG_CP0_USERLOCAL,
     UC_MIPS_REG_PC, UC_MIPS_REG_SP, UC_MIPS_REG_T9, UC_MIPS_REG_V0, UC_MIPS_REG_V1,
@@ -20,6 +20,8 @@ from unicorn.mips_const import (
 from unicorn.x86_const import (
     UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI,
     UC_X86_REG_EDX, UC_X86_REG_EIP, UC_X86_REG_ESI, UC_X86_REG_ESP,
+    UC_X86_REG_FS_BASE, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_RAX, UC_X86_REG_RDI,
+    UC_X86_REG_RDX, UC_X86_REG_RIP, UC_X86_REG_RSI, UC_X86_REG_RSP,
 )
 
 
@@ -34,9 +36,12 @@ class Arch:
     nr_reg: int               # register holding the syscall number
     arg_regs: tuple           # registers holding syscall arguments 0..n
     ret_reg: int
-    intr_no: int              # interrupt number Unicorn reports for the syscall instruction
+    intr_no: Optional[int]    # interrupt number Unicorn reports for the syscall instruction (None if hooked as an instruction)
     syscalls: dict            # number -> name
     word_size: int = 4
+    elfclass: int = 32                        # ELFCLASS the loader must see (32 or 64)
+    syscall_hook: str = "intr"                # "intr": UC_HOOK_INTR (int 0x80 / MIPS syscall); "insn_syscall": UC_HOOK_INSN on x86-64 `syscall`
+    select_takes_struct: bool = True          # old i386 select(2) takes ONE pointer to its 5 arguments
     # ---- ABI differences. Defaults describe Linux/i386; the fake kernel works in i386
     # ("canonical") constants and translates at the edges using these.
     stack_arg_offset: Optional[int] = None   # syscall args beyond len(arg_regs) live on the stack here
@@ -146,4 +151,34 @@ MIPSEL = Arch(
     user_limit=0x7EFF0000,
 )
 
-ARCHES = {a.e_machine: a for a in (I386, MIPSEL)}
+# Linux x86-64. Shares i386's "generic" ABI constants (errno numbers, socket types, open/mmap
+# flags), so those need no overrides. What differs: the `syscall` instruction (hooked as an
+# instruction, not an interrupt), register arguments rdi/rsi/rdx/r10/r8/r9, 8-byte words, a
+# single 144-byte struct stat, mmap() with plain register args, and TLS via arch_prctl(ARCH_SET_FS)
+# writing the FS base register instead of set_thread_area.
+X86_64 = Arch(
+    name="x86_64",
+    e_machine="EM_X86_64",
+    uc_arch=UC_ARCH_X86,
+    uc_mode=UC_MODE_64,
+    pc_reg=UC_X86_REG_RIP,
+    sp_reg=UC_X86_REG_RSP,
+    nr_reg=UC_X86_REG_RAX,
+    arg_regs=(UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_R10, UC_X86_REG_R8, UC_X86_REG_R9),
+    ret_reg=UC_X86_REG_RAX,
+    intr_no=None,
+    syscalls=_load_syscall_table("syscalls_x86_64.txt"),
+    word_size=8,
+    elfclass=64,
+    syscall_hook="insn_syscall",
+    select_takes_struct=False,
+    old_mmap_struct=False,
+    stat64=(24, 4, 48, 144),
+    stat32=(24, 4, 48, 144),
+    set_tls=lambda uc, addr: uc.reg_write(UC_X86_REG_FS_BASE, addr),
+    uname_machine="x86_64",
+    stack_top=0x7FFFFFFFF000,
+    user_limit=0x7F0000000000,
+)
+
+ARCHES = {a.e_machine: a for a in (I386, MIPSEL, X86_64)}
