@@ -31,7 +31,7 @@ MAX_FILES = 50
 MAX_FORKS = 16
 MAX_RECEIVED_ENTRIES = 200
 MAX_RECEIVED_BYTES = 2 * 1024 * 1024
-RELAY_MAX_WAIT = 2.0  # real seconds a select()/recv() will wait for relayed data
+LIVE_MAX_WAIT = 2.0  # real seconds a select()/recv() will wait for data from the real network
 MAX_PATH_SYSCALLS = 20_000  # per forked path, so an idle daemon loop can't starve the parent path
 MAX_MAPPED_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; larger address spaces are only partly restored
@@ -148,7 +148,8 @@ class Sock:
     proto: int
     remote: Optional[dict] = None
     recv_queue: deque = field(default_factory=deque)
-    relay: Optional[object] = None  # RelaySession when this stream is relayed to a real endpoint
+    live: Optional[object] = None  # LiveSession/LiveUdp when this socket uses the real network
+    live_peer: Optional[tuple] = None  # (ip, port) a live UDP socket last sent to
     conversation: Optional[dict] = None  # ordered record of what was sent on this socket
 
 
@@ -160,12 +161,12 @@ class Pipe:
 class FakeKernel:
     def __init__(self, uc, arch: Arch, *, brk_base: int, stack_low: int,
                  max_syscalls: int = 200_000, max_path_syscalls: int = MAX_PATH_SYSCALLS,
-                 relay=None, seed: int = 0x5EED) -> None:
+                 live_net=None, seed: int = 0x5EED) -> None:
         self.uc = uc
         self.arch = arch
         self.max_syscalls = max_syscalls
         self.max_path_syscalls = max_path_syscalls
-        self.relay = relay  # optional RelayClient; None = fully simulated network
+        self.live_net = live_net  # optional LiveNetwork; None = fully simulated network
         self.received: list[dict] = []
         self._received_bytes = 0
         self.path_syscalls = 0
@@ -1100,8 +1101,8 @@ class FakeKernel:
             data = bytes(obj.data[obj.pos:obj.pos + n])
             obj.pos += len(data)
         elif isinstance(obj, Sock):
-            if obj.relay is not None and not obj.recv_queue:
-                data = self._relay_recv(obj, n)
+            if obj.live is not None and not obj.recv_queue:
+                data = self._live_recv(obj, n)
                 if data is None:
                     return -EAGAIN
             elif obj.recv_queue:
@@ -1121,17 +1122,20 @@ class FakeKernel:
         self.write(buf, data)
         return len(data)
 
-    def _relay_recv(self, sock: Sock, n: int) -> Optional[bytes]:
-        """Receive from a relayed stream, really waiting (bounded) like a blocking recv would."""
-        data = sock.relay.recv(n)
+    def _live_recv(self, sock: Sock, n: int) -> Optional[bytes]:
+        """Receive from the real network, really waiting (bounded) like a blocking recv would."""
+        data = sock.live.recv(n)
         if data is None:
-            self.vtime += self.relay.wait_any([sock.relay], RELAY_MAX_WAIT)
-            data = sock.relay.recv(n)
-        if data:  # keep what the remote end sent: this is the intel the relay exists for
+            self.vtime += self.live_net.wait_any([sock.live], LIVE_MAX_WAIT)
+            data = sock.live.recv(n)
+        if data:  # keep what the remote end sent: commands, downloaded payloads
             if len(self.received) < MAX_RECEIVED_ENTRIES and self._received_bytes < MAX_RECEIVED_BYTES:
                 self._received_bytes += len(data)
                 remote = sock.remote or {}
-                self.received.append({"ip": remote.get("ip"), "port": remote.get("port"), "data": data})
+                ip, port = remote.get("ip"), remote.get("port")
+                if sock.live_peer:
+                    ip, port = sock.live_peer
+                self.received.append({"ip": ip, "port": port, "data": data})
         return data
 
     @staticmethod
@@ -1384,15 +1388,15 @@ class FakeKernel:
         if "ip" in remote:
             proto = "udp" if sock.type == SOCK_DGRAM else "tcp"
             self.network.append({"op": "connect", "proto": proto, **remote})
-            if (proto == "tcp" and self.relay is not None
-                    and self.relay.allows(remote["ip"], remote["port"])):
-                session = self.relay.open(remote["ip"], remote["port"])
+            if (proto == "tcp" and self.live_net is not None
+                    and self.live_net.allows(remote["ip"], remote["port"])):
+                session = self.live_net.open(remote["ip"], remote["port"])
                 if session is None:
-                    self.log("network", "connect", proto=proto, relayed=False,
-                             note="relay refused or unreachable", **remote)
+                    self.log("network", "connect", proto=proto, live=False,
+                             note="real connection failed or refused", **remote)
                     return -ECONNREFUSED
-                sock.relay = session
-                self.log("network", "connect", proto=proto, relayed=True, **remote)
+                sock.live = session
+                self.log("network", "connect", proto=proto, live=True, **remote)
                 return 0
             self.log("network", "connect", proto=proto, **remote)
         return 0  # otherwise always "succeeds" so the sample carries on to its next stage
@@ -1445,8 +1449,14 @@ class FakeKernel:
             self.network.append({"op": "sendto", "proto": proto, **dest})
             self.log("network", "sendto", proto=proto, **dest, bytes=len(data))
         self._record_sent(sock, proto, remote, data)
-        if sock.relay is not None and dest is None:
-            return len(data) if sock.relay.send(data) >= 0 else -EPIPE
+        if sock.live is not None and proto == "tcp":
+            return len(data) if sock.live.send(data) >= 0 else -EPIPE
+        if (proto == "udp" and self.live_net is not None and remote.get("ip")
+                and self.live_net.allows(remote["ip"], remote["port"])):
+            if sock.live is None:
+                sock.live = self.live_net.udp()
+            sock.live_peer = (remote["ip"], remote["port"])
+            return len(data) if sock.live.send(data, remote["ip"], remote["port"]) >= 0 else -EPIPE
         if proto == "udp" and remote.get("port") == 53:
             self._answer_dns(sock, data)
         return len(data)
@@ -1533,30 +1543,30 @@ class FakeKernel:
     def _readable(self, fd: int) -> bool:
         obj = self.fds.get(fd)
         if isinstance(obj, Sock):
-            return bool(obj.recv_queue) or (obj.relay is not None and obj.relay.readable())
+            return bool(obj.recv_queue) or (obj.live is not None and obj.live.readable())
         if isinstance(obj, Pipe):
             return bool(obj.buf)
         if isinstance(obj, EventFd):
             return obj.counter > 0
         return isinstance(obj, OpenFile) or (isinstance(obj, Device) and obj.name == "urandom")
 
-    def _relay_idle_wait(self, read_fds, timeout_s: float) -> None:
-        """If a relayed stream is being watched and nothing is readable yet, really wait for it
+    def _live_idle_wait(self, read_fds, timeout_s: float) -> None:
+        """If a real connection is being watched and nothing is readable yet, really wait for it
         (bounded) so a reply from the remote end isn't missed by racing ahead in virtual time."""
-        relayed = [self.fds[fd].relay for fd in read_fds
-                   if isinstance(self.fds.get(fd), Sock) and self.fds[fd].relay is not None
-                   and not self.fds[fd].relay.closed]
-        if relayed and not any(self._readable(fd) for fd in read_fds):
-            self.vtime += self.relay.wait_any(relayed, min(timeout_s, RELAY_MAX_WAIT))
+        live = [self.fds[fd].live for fd in read_fds
+                if isinstance(self.fds.get(fd), Sock) and self.fds[fd].live is not None
+                and not self.fds[fd].live.closed]
+        if live and not any(self._readable(fd) for fd in read_fds):
+            self.vtime += self.live_net.wait_any(live, min(timeout_s, LIVE_MAX_WAIT))
 
     def sys_poll(self, fds, nfds, timeout, *_):
-        if self.relay is not None and s32(timeout) > 0:
+        if self.live_net is not None and s32(timeout) > 0:
             watch = []
             for i in range(min(nfds, 1024)):
                 fd, events, _r = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
                 if fd >= 0 and events & POLLIN:
                     watch.append(fd)
-            self._relay_idle_wait(watch, s32(timeout) / 1000)
+            self._live_idle_wait(watch, s32(timeout) / 1000)
         ready = 0
         for i in range(min(nfds, 1024)):
             fd, events, _rev = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
@@ -1577,10 +1587,10 @@ class FakeKernel:
         n = min(n, 1024)
         bits = self.arch.word_size * 8
         nwords = (n + bits - 1) // bits
-        if self.relay is not None and timeout_s is not None and rfds:
+        if self.live_net is not None and timeout_s is not None and rfds:
             words = self.read_words(rfds, nwords)
             watch = [fd for fd in range(n) if words[fd // bits] >> (fd % bits) & 1]
-            self._relay_idle_wait(watch, timeout_s)
+            self._live_idle_wait(watch, timeout_s)
         ready = 0
         for ptr, kind in ((rfds, "r"), (wfds, "w"), (efds, "e")):
             if not ptr:

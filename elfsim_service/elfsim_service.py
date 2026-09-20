@@ -22,12 +22,14 @@ from assemblyline_v4_service.common.result import (
 from assemblyline_v4_service.common.task import PARENT_RELATION
 
 from elfsim_service.emulator import UnsupportedElf, emulate
+from elfsim_service.network import LiveNetwork
 from elfsim_service.textview import readable, text_runs
 
 MAX_ROWS = 30
 MAX_CONVERSATIONS = 8
 MAX_TRANSCRIPT_LINES = 25
 MAX_EXTRACTED = 10
+PAYLOAD_MIN_BYTES = 64          # a received stream at least this big is extracted as a payload
 RECONNECT_THRESHOLD = 5
 _LOCAL_NETS = [ipaddress.ip_network(n) for n in
                ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
@@ -82,12 +84,14 @@ class ElfSim(ServiceBase):
     def execute(self, request: ServiceRequest) -> None:
         result = Result()
         argv = ["/tmp/sample"] + shlex.split(request.get_param("arguments") or "")
+        internet = bool(request.get_param("allow_internet"))
+        network = LiveNetwork() if internet else None   # real connections to public addresses only
         try:
             report = emulate(
                 request.file_contents, argv=argv,
                 max_instructions=request.get_param("max_instructions"),
                 timeout_s=request.get_param("emulation_timeout_seconds"),
-                max_syscalls=request.get_param("max_syscalls"),
+                max_syscalls=request.get_param("max_syscalls"), network=network,
             )
         except UnsupportedElf as e:
             # Not something we can emulate (other CPU, dynamic linking...). Silent on purpose:
@@ -100,10 +104,11 @@ class ElfSim(ServiceBase):
             request.result = result
             return
 
-        self._summary(result, report)
+        self._summary(result, report, internet)
         self._network(result, report)
         self._dns(result, report)
         self._sent_data(result, report)
+        self._received(request, result, report)
         self._processes(result, report, argv)
         self._files(request, result, report, argv)
         self._fault(result, report)
@@ -111,7 +116,7 @@ class ElfSim(ServiceBase):
         self._save_report(request, report)
 
     # ------------------------------------------------------------------ sections
-    def _summary(self, result: Result, report) -> None:
+    def _summary(self, result: Result, report, internet: bool = False) -> None:
         stop = report.stop_reason
         if stop.startswith("exit("):
             stop = f"sample exited (exit code {stop[5:-1]})"
@@ -121,6 +126,8 @@ class ElfSim(ServiceBase):
         section.set_item("entry_point", hex(report.entry))
         section.set_item("stopped_because", _STOP_TEXT.get(report.stop_reason, stop))
         section.set_item("syscalls_emulated", report.syscalls_total)
+        if internet:
+            section.set_item("internet_access", "enabled: real connections to public addresses")
         if abandoned:
             section.set_item("idle_forked_paths_abandoned", abandoned)
         if report.threads_created:
@@ -222,6 +229,43 @@ class ElfSim(ServiceBase):
         section = ResultSection(
             "What the sample sent (control bytes shown as \\xNN)", body="\n\n".join(blocks))
         section.set_heuristic(4, signature="data_sent")
+        result.add_section(section)
+
+    def _received(self, request: ServiceRequest, result: Result, report) -> None:
+        """What real remote hosts sent back (only with internet access on). A stream big enough to
+        be a file is extracted so Assemblyline analyses the payload the C2 handed over."""
+        streams: dict = {}
+        for r in report.received:
+            streams.setdefault((r["ip"], r["port"]), []).append(r["data"])
+        if not streams:
+            return
+        heur, blocks, extracted = Heuristic(8), [], 0
+        for (ip, port), chunks in list(streams.items())[:MAX_CONVERSATIONS]:
+            runs: list = []
+            for chunk in chunks:                      # collapse consecutive identical replies
+                if runs and runs[-1][0] == chunk:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([chunk, 1])
+            lines = [f"<- {ip}:{port}"]
+            lines += [f"    {readable(c, 300)}" + (f"    x{n}" if n > 1 else "") for c, n in runs[:MAX_TRANSCRIPT_LINES]]
+            data = b"".join(chunks)
+            words = text_runs(data)
+            if words:
+                lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
+            blocks.append("\n".join(lines))
+            heur.add_signature_id("data_received")
+            if len(data) >= PAYLOAD_MIN_BYTES and extracted < MAX_EXTRACTED:
+                path = os.path.join(self.working_directory, f"received_{extracted}.bin")
+                with open(path, "wb") as f:
+                    f.write(data)
+                request.add_extracted(path, f"received_{ip}_{port}.bin",
+                                      f"Data received from {ip}:{port} during emulation (real network)",
+                                      parent_relation=PARENT_RELATION.DOWNLOADED)
+                heur.add_signature_id("payload_received")
+                extracted += 1
+        section = ResultSection("What remote hosts sent back (real network)", body="\n\n".join(blocks))
+        section.set_heuristic(heur)
         result.add_section(section)
 
     def _processes(self, result: Result, report, argv: list) -> None:
@@ -350,6 +394,8 @@ class ElfSim(ServiceBase):
                       "total_bytes": c["total_bytes"],
                       "messages": [{"text": readable(m, 2048), "hex": m.hex(), "times": n}
                                    for m, n in c["messages"]]} for c in report.sent],
+            "received": [{"ip": r["ip"], "port": r["port"], "text": readable(r["data"], 2048),
+                          "hex": r["data"].hex()} for r in report.received],
             "stdout": report.stdout.decode("latin-1"),
             "files": {p: len(c) for p, c in report.files.items()},
         }

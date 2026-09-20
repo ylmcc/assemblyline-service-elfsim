@@ -14,7 +14,11 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 - The sample's instructions are interpreted in-process by Unicorn. Nothing runs on the host CPU.
 - There is no real network, filesystem, process table or clock behind the syscalls. A
   `connect()` is recorded and answered "success" from memory; a file write lands in a
-  Python `bytearray`. The manifest sets `allow_internet_access: false`.
+  Python `bytearray`. By default the network is simulated too; the `allow_internet` submission parameter (off by default) makes
+  TCP connects and UDP datagrams to **public** addresses real, so the sample reaches its actual C2 and
+  whatever it receives (commands, payloads) is captured and extracted. Internal addresses (loopback,
+  RFC 1918, link-local, cloud metadata) are never reachable. The pod needs `allow_internet_access: true`
+  for this, and the service is flagged `is_external: true`.
 - Limits are enforced on instructions, syscalls, wall-clock time and mapped memory, so a
   sample that spins forever (typical of a bot's main loop) ends in a bounded time.
 - Manual diagnosis on a real sample should still be done inside a locked-down container
@@ -66,6 +70,7 @@ emulation stops with a `deadlock` reason instead of spinning.
 | `max_instructions` | 50,000,000 | instruction budget per execution path |
 | `emulation_timeout_seconds` | 60 | wall-clock limit |
 | `max_syscalls` | 200,000 | total syscall budget |
+| `allow_internet` | off | let the sample really connect to public internet addresses (see Safety model) |
 
 ## Limitations
 

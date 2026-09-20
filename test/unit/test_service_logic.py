@@ -176,7 +176,8 @@ def test_unsupported_file_gets_a_collapsed_explanation_with_no_heuristic():
 
         def get_param(self, name):
             return {"arguments": "", "max_instructions": 1000,
-                    "emulation_timeout_seconds": 5, "max_syscalls": 1000}[name]
+                    "emulation_timeout_seconds": 5, "max_syscalls": 1000,
+                    "allow_internet": False}[name]
     req = Req()
     ElfSim().execute(req)
     (section,) = req.result.sections
@@ -197,7 +198,8 @@ def test_mips_sample_is_emulated_end_to_end_through_the_service():
 
         def get_param(self, name):
             return {"arguments": "", "max_instructions": 1_000_000,
-                    "emulation_timeout_seconds": 10, "max_syscalls": 10000}[name]
+                    "emulation_timeout_seconds": 10, "max_syscalls": 10000,
+                    "allow_internet": False}[name]
 
         def add_supplementary(self, *a, **k):
             self.supp.append(a[1])

@@ -4,7 +4,7 @@ description: >
   Pure-emulation "detonator" for 32-bit Linux ELF malware (Mirai/Gafgyt-style IoT bots and
   similar statically linked binaries). The sample is NEVER executed: Unicorn interprets its
   instructions and an in-memory fake kernel answers every syscall, so there is no real
-  network, filesystem or process behind it. Reports what the sample tried to do -- C2
+  filesystem or process behind it, and by default no network either. Reports what the sample tried to do -- C2
   connections and registration data, DNS lookups, files dropped, fork/exec, process
   renaming -- which static analysis cannot recover from stripped, statically linked bots.
   Emulates static, non-PIE x86 (32- and 64-bit) and little-endian MIPS (o32) binaries. Other CPU
@@ -35,6 +35,10 @@ submission_params:
     type: int
     default: 60
     value: 60
+  - name: allow_internet
+    type: bool
+    default: false
+    value: false
   - name: max_syscalls
     type: int
     default: 200000
@@ -99,9 +103,20 @@ heuristics:
     filetype: ".*"
     score: 0
 
+  - heur_id: 8
+    name: Data received from a remote host
+    description: With internet access enabled, the sample received data from a real remote host; a stream large enough to be a file is extracted as a payload.
+    filetype: ".*"
+    score: 0
+    max_score: 300
+    signature_score_map:
+      data_received: 0
+      payload_received: 300
+    attack_id: T1105
+
 docker_config:
   image: kylemc54321/assemblyline-service-elfsim:$SERVICE_TAG
   cpu_cores: 1
   ram_mb_min: 512
   ram_mb: 1024
-  allow_internet_access: false
+  allow_internet_access: true
