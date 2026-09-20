@@ -16,6 +16,8 @@ _ARG_REGS = (EBX, ECX, EDX, ESI, EDI, EBP)
 
 
 class Prog:
+    base = BASE          # load address; subclasses for other ABIs override it
+
     def __init__(self) -> None:
         self.code = bytearray()
         self.data = bytearray()
@@ -27,7 +29,7 @@ class Prog:
         """Place ``blob`` in the data area (4-byte aligned) and return its address."""
         while len(self.data) % 4:
             self.data.append(0)
-        addr = BASE + DATA_OFF + len(self.data)
+        addr = self.base + DATA_OFF + len(self.data)
         self.data += blob
         return addr
 
@@ -45,7 +47,7 @@ class Prog:
     # -- code ---------------------------------------------------------------
     @property
     def here(self) -> int:
-        return BASE + CODE_OFF + len(self.code)
+        return self.base + CODE_OFF + len(self.code)
 
     def raw(self, b: bytes) -> None:
         self.code += b
@@ -78,6 +80,11 @@ class Prog:
         self.code += b"\xe9\0\0\0\0"
         self.fixups.append((len(self.code) - 4, name))
 
+    def loop_dec(self, counter_addr: int, name: str) -> None:
+        """dec dword [counter_addr]; jnz name  (a guest-side loop without unrolling code)."""
+        self.code += b"\xff\x0d" + struct.pack("<I", counter_addr) + b"\x0f\x85\0\0\0\0"
+        self.fixups.append((len(self.code) - 4, name))
+
     def jnz(self, name: str) -> None:
         self.code += b"\x85\xc0\x0f\x85\0\0\0\0"  # test eax,eax ; jnz rel32
         self.fixups.append((len(self.code) - 4, name))
@@ -86,16 +93,17 @@ class Prog:
         self.sys(1, code)
 
     # -- output -------------------------------------------------------------
-    def build(self, machine: int = 3) -> bytes:
+    def build(self, machine: int = 3, flags: int = 0) -> bytes:
+        assert len(self.code) <= DATA_OFF - CODE_OFF, "code overflows into the data area"
         for pos, name in self.fixups:
             target = self.labels[name]
-            after = BASE + CODE_OFF + pos + 4
+            after = self.base + CODE_OFF + pos + 4
             self.code[pos:pos + 4] = struct.pack("<i", target - after)
         blob = bytearray(DATA_OFF + len(self.data))
         blob[CODE_OFF:CODE_OFF + len(self.code)] = self.code
         blob[DATA_OFF:] = self.data
         ehdr = (b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\0" * 8
-                + struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, BASE + CODE_OFF, 52, 0, 0,
+                + struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, BASE + CODE_OFF, 52, 0, flags,
                               52, 32, 1, 0, 0, 0))
         phdr = struct.pack("<8I", 1, 0, BASE, BASE, len(blob), len(blob) + 0x2000, 7, 0x1000)
         blob[0:52] = ehdr

@@ -22,9 +22,14 @@ from assemblyline_v4_service.common.result import (
 from assemblyline_v4_service.common.task import PARENT_RELATION
 
 from elfsim_service.emulator import UnsupportedElf, emulate
+from elfsim_service.network import LiveNetwork
+from elfsim_service.textview import readable, text_runs
 
 MAX_ROWS = 30
+MAX_CONVERSATIONS = 8
+MAX_TRANSCRIPT_LINES = 25
 MAX_EXTRACTED = 10
+PAYLOAD_MIN_BYTES = 64          # a received stream at least this big is extracted as a payload
 RECONNECT_THRESHOLD = 5
 _LOCAL_NETS = [ipaddress.ip_network(n) for n in
                ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
@@ -33,6 +38,7 @@ _STOP_TEXT = {
     "syscall_limit": "syscall budget exhausted (typical of a bot looping on its C2 / event loop)",
     "instruction_limit": "instruction budget exhausted (typical of a bot idling in a main loop)",
     "timeout": "emulation time limit reached",
+    "deadlock": "every thread was blocked waiting on another (nothing left that could wake them)",
     "execve": "sample exec'd another program",
     "fault": "emulation stopped on a CPU fault (see the error section)",
 }
@@ -47,9 +53,25 @@ def _is_local(ip: str) -> bool:
             or any(addr in n for n in _LOCAL_NETS if n.version == addr.version))
 
 
-def _preview(data: bytes, limit: int = 48) -> str:
-    text = "".join(chr(b) if 32 <= b < 127 else "." for b in data[:limit])
-    return f"{data[:limit].hex()}  |{text}|"
+def _transcript(proto: str, messages: tuple, reps: list) -> list:
+    """Readable lines for one conversation. TCP is a byte stream with no message boundaries, so
+    adjacent one-off sends read as a single stream; UDP datagrams stay separate. Repeated sends
+    (heartbeats) become one line with a count or range."""
+    lines, pending = [], b""
+    for (data, _), (low, high) in zip(messages, reps):
+        if high == 1:
+            if proto == "tcp":
+                pending += data
+                continue
+            lines.append(readable(data))
+            continue
+        if pending:
+            lines.append(readable(pending))
+            pending = b""
+        lines.append(f"{readable(data)}    x{low if low == high else f'{low}-{high}'}")
+    if pending:
+        lines.append(readable(pending))
+    return lines[:MAX_TRANSCRIPT_LINES]
 
 
 class ElfSim(ServiceBase):
@@ -62,24 +84,31 @@ class ElfSim(ServiceBase):
     def execute(self, request: ServiceRequest) -> None:
         result = Result()
         argv = ["/tmp/sample"] + shlex.split(request.get_param("arguments") or "")
+        internet = bool(request.get_param("allow_internet"))
+        network = LiveNetwork() if internet else None   # real connections to public addresses only
         try:
             report = emulate(
                 request.file_contents, argv=argv,
                 max_instructions=request.get_param("max_instructions"),
                 timeout_s=request.get_param("emulation_timeout_seconds"),
-                max_syscalls=request.get_param("max_syscalls"),
+                max_syscalls=request.get_param("max_syscalls"), network=network,
             )
         except UnsupportedElf as e:
             # Not something we can emulate (other CPU, dynamic linking...). Silent on purpose:
             # this would fire on a large share of accepted files and isn't actionable.
             self.log.info(f"ElfSim skipping sample: {e}")
+            # A collapsed note with no heuristic (so no score and no noise) that answers "why
+            # didn't it run?" without anyone needing the pod logs.
+            result.add_section(ResultSection("ElfSim did not emulate this file", body=str(e),
+                                             auto_collapse=True))
             request.result = result
             return
 
-        self._summary(result, report)
+        self._summary(result, report, internet)
         self._network(result, report)
         self._dns(result, report)
         self._sent_data(result, report)
+        self._received(request, result, report)
         self._processes(result, report, argv)
         self._files(request, result, report, argv)
         self._fault(result, report)
@@ -87,7 +116,7 @@ class ElfSim(ServiceBase):
         self._save_report(request, report)
 
     # ------------------------------------------------------------------ sections
-    def _summary(self, result: Result, report) -> None:
+    def _summary(self, result: Result, report, internet: bool = False) -> None:
         stop = report.stop_reason
         if stop.startswith("exit("):
             stop = f"sample exited (exit code {stop[5:-1]})"
@@ -97,10 +126,16 @@ class ElfSim(ServiceBase):
         section.set_item("entry_point", hex(report.entry))
         section.set_item("stopped_because", _STOP_TEXT.get(report.stop_reason, stop))
         section.set_item("syscalls_emulated", report.syscalls_total)
+        if internet:
+            section.set_item("internet_access", "enabled: real connections to public addresses")
         if abandoned:
             section.set_item("idle_forked_paths_abandoned", abandoned)
+        if report.threads_created:
+            section.set_item("threads_created", report.threads_created)
         if report.unknown_syscalls:
             section.set_item("unimplemented_syscalls", ", ".join(sorted(report.unknown_syscalls)))
+        for i, note in enumerate(report.warnings, 1):
+            section.set_item(f"note_{i}" if len(report.warnings) > 1 else "note", note)
         section.set_item("runtime_seconds", round(report.elapsed, 2))
         section.set_heuristic(1, signature="emulation_completed")
         result.add_section(section)
@@ -162,18 +197,76 @@ class ElfSim(ServiceBase):
         result.add_section(table)
 
     def _sent_data(self, result: Result, report) -> None:
-        sends: Counter = Counter()
-        for s in report.sent:
-            if s["proto"] != "netlink" and s["ip"]:
-                sends[(s["proto"], s["ip"], s["port"], s["data"])] += 1
-        if not sends:
+        """A readable transcript of what the sample sent, one entry per distinct conversation
+        (a bot that reconnects 76 times with the same registration shows up once, x76)."""
+        groups: dict = {}
+        for conv in report.sent:
+            if conv["proto"] == "netlink" or not conv["ip"]:
+                continue
+            # Group on *what* was sent; a repeat count of 2+ (heartbeats) only widens a range,
+            # so a session cut short doesn't split an otherwise identical conversation.
+            key = (conv["proto"], conv["ip"], conv["port"],
+                   tuple((bytes(m), 1 if n == 1 else 2) for m, n in conv["messages"]))
+            group = groups.setdefault(key, {"connections": 0, "reps": [[n, n] for _, n in conv["messages"]]})
+            group["connections"] += 1
+            for span, (_, n) in zip(group["reps"], conv["messages"]):
+                span[0], span[1] = min(span[0], n), max(span[1], n)
+        if not groups:
             return
-        table = ResultTableSection("Data the sample sent (first bytes; hex | ascii)")
-        for (proto, ip, port, data), count in sends.most_common(MAX_ROWS):
-            table.add_row(TableRow(destination=f"{proto}://{ip}:{port}", bytes=len(data),
-                                   times=count, preview=_preview(data)))
-        table.set_heuristic(4, signature="data_sent")
-        result.add_section(table)
+
+        blocks = []
+        for (proto, ip, port, messages), group in sorted(
+                groups.items(), key=lambda kv: -kv[1]["connections"])[:MAX_CONVERSATIONS]:
+            title = f"-> {proto}://{ip}:{port}"
+            if group["connections"] > 1:
+                title += f"   (identical in {group['connections']} connections)"
+            lines = [title] + ["    " + l for l in _transcript(proto, messages, group["reps"])]
+            words = text_runs(b"".join(m for m, _ in messages))
+            if words:
+                lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
+            blocks.append("\n".join(lines))
+
+        section = ResultSection(
+            "What the sample sent (control bytes shown as \\xNN)", body="\n\n".join(blocks))
+        section.set_heuristic(4, signature="data_sent")
+        result.add_section(section)
+
+    def _received(self, request: ServiceRequest, result: Result, report) -> None:
+        """What real remote hosts sent back (only with internet access on). A stream big enough to
+        be a file is extracted so Assemblyline analyses the payload the C2 handed over."""
+        streams: dict = {}
+        for r in report.received:
+            streams.setdefault((r["ip"], r["port"]), []).append(r["data"])
+        if not streams:
+            return
+        heur, blocks, extracted = Heuristic(8), [], 0
+        for (ip, port), chunks in list(streams.items())[:MAX_CONVERSATIONS]:
+            runs: list = []
+            for chunk in chunks:                      # collapse consecutive identical replies
+                if runs and runs[-1][0] == chunk:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([chunk, 1])
+            lines = [f"<- {ip}:{port}"]
+            lines += [f"    {readable(c, 300)}" + (f"    x{n}" if n > 1 else "") for c, n in runs[:MAX_TRANSCRIPT_LINES]]
+            data = b"".join(chunks)
+            words = text_runs(data)
+            if words:
+                lines.append("    readable text: " + ", ".join(f'"{w}"' for w in words))
+            blocks.append("\n".join(lines))
+            heur.add_signature_id("data_received")
+            if len(data) >= PAYLOAD_MIN_BYTES and extracted < MAX_EXTRACTED:
+                path = os.path.join(self.working_directory, f"received_{extracted}.bin")
+                with open(path, "wb") as f:
+                    f.write(data)
+                request.add_extracted(path, f"received_{ip}_{port}.bin",
+                                      f"Data received from {ip}:{port} during emulation (real network)",
+                                      parent_relation=PARENT_RELATION.DOWNLOADED)
+                heur.add_signature_id("payload_received")
+                extracted += 1
+        section = ResultSection("What remote hosts sent back (real network)", body="\n\n".join(blocks))
+        section.set_heuristic(heur)
+        result.add_section(section)
 
     def _processes(self, result: Result, report, argv: list) -> None:
         rows: Counter = Counter()
@@ -278,8 +371,12 @@ class ElfSim(ServiceBase):
         body = f"{err.get('type', 'unknown error')} at pc={err.get('pc', '?')}"
         if err.get("bytes_at_pc"):
             body += f" (bytes at pc: {err['bytes_at_pc']})"
-        body += (f"\nEmulation stopped after {report.syscalls_total} syscalls. This usually means "
-                 "an unsupported instruction, TLS/thread setup, or a packed/self-modifying sample.")
+        if report.warnings:
+            cause = next((w for w in report.warnings if "truncated" in w), report.warnings[0])
+            body += "\nLikely cause: " + cause
+        else:
+            body += (f"\nEmulation stopped after {report.syscalls_total} syscalls. This usually means "
+                     "an unsupported instruction, TLS/thread setup, or a packed/self-modifying sample.")
         section = ResultSection("Emulation stopped on a CPU fault", body=body)
         section.set_heuristic(7, signature=err.get("type", "fault").replace(" ", "_"))
         result.add_section(section)
@@ -293,7 +390,12 @@ class ElfSim(ServiceBase):
             "unimplemented_syscalls": report.unknown_syscalls,
             "events": report.events, "events_dropped": report.events_dropped,
             "network": report.network,
-            "sent": [{**s, "data": s["data"].hex()} for s in report.sent],
+            "sent": [{"proto": c["proto"], "ip": c["ip"], "port": c["port"],
+                      "total_bytes": c["total_bytes"],
+                      "messages": [{"text": readable(m, 2048), "hex": m.hex(), "times": n}
+                                   for m, n in c["messages"]]} for c in report.sent],
+            "received": [{"ip": r["ip"], "port": r["port"], "text": readable(r["data"], 2048),
+                          "hex": r["data"].hex()} for r in report.received],
             "stdout": report.stdout.decode("latin-1"),
             "files": {p: len(c) for p, c in report.files.items()},
         }

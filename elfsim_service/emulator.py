@@ -11,14 +11,15 @@ from typing import Optional
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
-from unicorn import UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
+from unicorn import UC_HOOK_INSN, UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
+from unicorn.x86_const import UC_X86_INS_SYSCALL
 
 from elfsim_service.arch import ARCHES, Arch
 from elfsim_service.kernel import PAGE, FakeKernel
 
-STACK_TOP = 0xC0000000
 STACK_SIZE = 0x100000
 MAX_IMAGE_BYTES = 128 * 1024 * 1024
+THREAD_SLICE = 500_000                    # instructions a thread runs before others get a turn
 
 AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY = 0, 3, 4, 5, 6, 9
 AT_UID, AT_EUID, AT_GID, AT_EGID, AT_RANDOM = 11, 12, 13, 14, 25
@@ -48,13 +49,15 @@ class EmulationReport:
     files: dict = field(default_factory=dict)       # path -> bytes the sample wrote
     file_modes: dict = field(default_factory=dict)  # path -> last chmod mode
     stdout: bytes = b""
-    sent: list = field(default_factory=list)
-    received: list = field(default_factory=list)  # bytes a relayed remote end sent back
+    sent: list = field(default_factory=list)  # one conversation per socket: [{proto, ip, port, messages: [[bytes, repeats]...], total_bytes}]
+    received: list = field(default_factory=list)  # bytes remote hosts sent back (real network only)
     syscall_counts: dict = field(default_factory=dict)
     unknown_syscalls: dict = field(default_factory=dict)
     syscalls_total: int = 0
     open_counts: dict = field(default_factory=dict)  # most-opened paths (diagnostics)
     elapsed: float = 0.0
+    threads_created: int = 0
+    warnings: list = field(default_factory=list)  # oddities in the file itself (e.g. truncated segments)
 
 
 def _align_down(v: int) -> int:
@@ -78,7 +81,7 @@ def _describe_fault(uc: Uc, arch: Arch, e: UcError) -> dict:
 
 def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int = 50_000_000,
             timeout_s: float = 30.0, max_syscalls: int = 200_000,
-            relay=None) -> EmulationReport:
+            network=None) -> EmulationReport:
     started = time.monotonic()
     try:
         elf = ELFFile(io.BytesIO(data))
@@ -86,8 +89,16 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         arch = ARCHES.get(machine)
         if arch is None:
             raise UnsupportedElf(f"unsupported machine {machine}")
-        if elf.elfclass != 32 or not elf.little_endian:
-            raise UnsupportedElf("only 32-bit little-endian ELF is supported")
+        if elf.elfclass != arch.elfclass or not elf.little_endian:
+            raise UnsupportedElf(f"unsupported ELF variant for {machine}: expected {arch.elfclass}-bit "
+                                 f"little-endian, got {elf.elfclass}-bit "
+                                 f"{'little' if elf.little_endian else 'big'}-endian")
+        if machine == "EM_MIPS":
+            flags = elf.header["e_flags"]
+            if flags & 0x20:      # EF_MIPS_ABI2: the N32 ABI has a different syscall interface
+                raise UnsupportedElf("MIPS N32 ABI is not supported (o32 only)")
+            if flags & 0x06000000:  # EF_MIPS_ARCH_ASE_M16 | EF_MIPS_ARCH_ASE_MICROMIPS
+                raise UnsupportedElf("MIPS16/microMIPS code is not supported")
         if elf.header["e_type"] != "ET_EXEC":
             raise UnsupportedElf(f"unsupported ELF type {elf.header['e_type']}")
         segments = [s for s in elf.iter_segments()]
@@ -96,6 +107,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         loads = [s for s in segments if s["p_type"] == "PT_LOAD"]
         entry = elf.header["e_entry"]
         phoff, phnum = elf.header["e_phoff"], elf.header["e_phnum"]
+        phentsize = elf.header["e_phentsize"]
     except (ELFError, KeyError, struct.error) as e:
         raise UnsupportedElf(f"malformed ELF: {e}")
     if not loads:
@@ -107,12 +119,20 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     mapped_pages: set = set()
     image_end = 0
     phdr_addr = None
+    warnings: list = []
     for seg in loads:
         vaddr, memsz, filesz, off = seg["p_vaddr"], seg["p_memsz"], seg["p_filesz"], seg["p_offset"]
-        if filesz > memsz or off + filesz > len(data):
-            raise UnsupportedElf("segment extends past end of file")
+        if filesz > memsz:
+            raise UnsupportedElf("segment file size exceeds its memory size")
+        if off + filesz > len(data):
+            # A real kernel maps what the file has and zero-fills the rest, so do the same, but
+            # say so: the file is shorter than its headers claim (truncated download, or a
+            # packer such as UPX that lies about sizes), so emulation may end early.
+            warnings.append(f"segment at {hex(vaddr)} claims {filesz} file bytes but only "
+                            f"{max(0, len(data) - off)} exist; the missing {min(filesz, off + filesz - len(data))} "
+                            "bytes are treated as zeros")
         start, end = _align_down(vaddr), _align_up(vaddr + memsz)
-        if end > 0xBF000000 or end - start > MAX_IMAGE_BYTES:
+        if end > arch.user_limit or end - start > MAX_IMAGE_BYTES:
             raise UnsupportedElf("segment address/size out of supported range")
         run_start = None
         for page in range(start, end + PAGE, PAGE):
@@ -129,9 +149,20 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     if sum(1 for _ in mapped_pages) * PAGE > MAX_IMAGE_BYTES:
         raise UnsupportedElf("image too large")
 
+    for seg in loads:   # is the entry point even inside the bytes we were given?
+        if seg["p_vaddr"] <= entry < seg["p_vaddr"] + seg["p_filesz"]:
+            entry_off = seg["p_offset"] + entry - seg["p_vaddr"]
+            if entry_off >= len(data):
+                warnings.append(f"the entry point is at file offset {hex(entry_off)} but the file is only "
+                                f"{len(data)} bytes: it is truncated and the code it starts with is missing")
+    if b"UPX!" in data[:0x200]:
+        warnings.append("UPX-packed: the real program is compressed inside; run it through an unpacker "
+                        "(AssemblyLine's Extraction services) so the unpacked file is analysed too")
+
     # ---- stack: strings, then argc/argv/envp/auxv
-    uc.mem_map(STACK_TOP - STACK_SIZE, STACK_SIZE, UC_PROT_ALL)
-    sp = STACK_TOP - 0x100
+    stack_top = arch.stack_top
+    uc.mem_map(stack_top - STACK_SIZE, STACK_SIZE, UC_PROT_ALL)
+    sp = stack_top - 0x100
 
     def push_bytes(b: bytes) -> int:
         nonlocal sp
@@ -147,16 +178,19 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     auxv = [(AT_PAGESZ, PAGE), (AT_ENTRY, entry), (AT_UID, 0), (AT_EUID, 0), (AT_GID, 0),
             (AT_EGID, 0), (AT_RANDOM, rand_ptr)]
     if phdr_addr is not None:
-        auxv += [(AT_PHDR, phdr_addr), (AT_PHENT, 32), (AT_PHNUM, phnum)]
+        auxv += [(AT_PHDR, phdr_addr), (AT_PHENT, phentsize), (AT_PHNUM, phnum)]
     auxv.append((AT_NULL, 0))
     words = [len(argv)] + argv_ptrs + [0] + env_ptrs + [0] + [w for kv in auxv for w in kv]
-    sp = (sp - 4 * len(words)) & ~0xF
-    uc.mem_write(sp, struct.pack(f"<{len(words)}I", *words))
+    word_fmt = "Q" if arch.word_size == 8 else "I"          # argc/argv/envp/auxv are machine words
+    sp = (sp - arch.word_size * len(words)) & ~0xF
+    uc.mem_write(sp, struct.pack(f"<{len(words)}{word_fmt}", *words))
     uc.reg_write(arch.sp_reg, sp)
+    for reg, value in arch.entry_regs.items():   # e.g. MIPS: $t9 = entry, as PIC-aware startup code expects
+        uc.reg_write(reg, entry if value == "entry" else value)
 
-    kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=STACK_TOP - STACK_SIZE,
-                        max_syscalls=max_syscalls, relay=relay)
-    report = EmulationReport(arch=arch.name, entry=entry)
+    kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=stack_top - STACK_SIZE,
+                        max_syscalls=max_syscalls, live_net=network)
+    report = EmulationReport(arch=arch.name, entry=entry, warnings=warnings)
     fault: dict = {}
 
     def on_interrupt(uc_, intno, _user):
@@ -167,26 +201,43 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
                               "pc": hex(uc_.reg_read(arch.pc_reg))}
             kernel._stop("interrupt")
 
-    uc.hook_add(UC_HOOK_INTR, on_interrupt)
+    if arch.syscall_hook == "insn_syscall":
+        # x86-64: the `syscall` instruction is not an interrupt, so hook the instruction itself.
+        # Unicorn resumes after it once the callback returns, exactly as for `int 0x80`.
+        def on_syscall_insn(uc_, _user):
+            kernel.handle()
+
+        uc.hook_add(UC_HOOK_INSN, on_syscall_insn, None, 1, 0, UC_X86_INS_SYSCALL)
+    else:
+        uc.hook_add(UC_HOOK_INTR, on_interrupt)
 
     # ---- run. Each emu_start segment ends on exit, execve, a limit, or a fork rewind.
     deadline = started + timeout_s
     pc = entry
+    thread_budget = max_instructions      # shared by all threads, consumed slice by slice
     while True:
         if kernel.resume is not None:  # rewind to the parent of a finished/abandoned fork
             record, kernel.resume = kernel.resume, None
             pc = kernel.rewind(record)
+        elif kernel.switch_to is not None:       # a syscall blocked/yielded: hand the CPU to another thread
+            pc = kernel.activate_thread()
         remaining_us = int((deadline - time.monotonic()) * 1_000_000)
         if remaining_us <= 0:
             report.stop_reason = "timeout"
             break
+        threaded = len(kernel.threads) > 1
+        count = min(THREAD_SLICE, thread_budget) if threaded else max_instructions
         try:
-            uc.emu_start(pc, 0, timeout=remaining_us, count=max_instructions)
+            uc.emu_start(pc, 0, timeout=remaining_us, count=count)
         except UcError as e:
             report.error = _describe_fault(uc, arch, e)
             report.stop_reason = "fault"
             break
-        if kernel.resume is not None:
+        if kernel.resume is not None or kernel.switch_to is not None:
+            continue
+        if kernel.replan:                         # a thread was just created: continue this one, now sliced
+            kernel.replan = False
+            pc = uc.reg_read(arch.pc_reg)
             continue
         if kernel.stop_reason:
             report.stop_reason = kernel.stop_reason
@@ -194,6 +245,13 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         if time.monotonic() >= deadline:
             report.stop_reason = "timeout"
             break
+        if threaded:                              # time slice used up: let the other threads run
+            thread_budget -= count
+            if thread_budget <= 0:
+                report.stop_reason = "instruction_limit"
+                break
+            kernel.yield_thread()
+            continue
         if kernel.has_pending_forks:
             kernel.abandon_path("instruction budget exhausted")
             pc = uc.reg_read(arch.pc_reg)
@@ -212,11 +270,12 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     report.stdout = bytes(kernel.stdout)
     report.sent = kernel.sent
     report.received = kernel.received
-    if relay is not None:
-        relay.close_all()
+    if network is not None:
+        network.close_all()
     report.syscall_counts = dict(kernel.counts)
     report.unknown_syscalls = dict(kernel.unknown_syscalls)
     report.syscalls_total = kernel.syscall_count
+    report.threads_created = kernel.threads_created
     report.open_counts = dict(kernel.open_counts.most_common(20))
     report.elapsed = time.monotonic() - started
     return report
