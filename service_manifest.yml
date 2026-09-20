@@ -1,0 +1,106 @@
+name: ElfSim
+version: $SERVICE_TAG
+description: >
+  Pure-emulation "detonator" for 32-bit Linux ELF malware (Mirai/Gafgyt-style IoT bots and
+  similar statically linked binaries). The sample is NEVER executed: Unicorn interprets its
+  instructions and an in-memory fake kernel answers every syscall, so there is no real
+  network, filesystem or process behind it. Reports what the sample tried to do -- C2
+  connections and registration data, DNS lookups, files dropped, fork/exec, process
+  renaming -- which static analysis cannot recover from stripped, statically linked bots.
+  Currently emulates x86 (i386); other CPU architectures are skipped silently.
+
+accepts: executable/linux/elf32
+rejects: empty|metadata/.*
+
+stage: SECONDARY
+category: Dynamic Analysis
+file_required: true
+timeout: 120
+disable_cache: false
+enabled: true
+is_external: false
+licence_count: 0
+
+submission_params:
+  - name: arguments
+    type: str
+    default: ""
+    value: ""
+  - name: max_instructions
+    type: int
+    default: 50000000
+    value: 50000000
+  - name: emulation_timeout_seconds
+    type: int
+    default: 60
+    value: 60
+  - name: max_syscalls
+    type: int
+    default: 200000
+    value: 200000
+
+heuristics:
+  - heur_id: 1
+    name: Emulation summary
+    description: The sample was emulated; this section summarises how far it got.
+    filetype: ".*"
+    score: 0
+  - heur_id: 2
+    name: Network connection attempted
+    description: The sample tried to open a network connection during emulation (simulated, never real traffic).
+    filetype: ".*"
+    score: 0
+    max_score: 400
+    signature_score_map:
+      tcp_connect: 100
+      persistent_reconnect: 300
+      udp_connect: 0
+      udp_probe: 0
+      bind_port: 0
+    attack_id: T1095
+  - heur_id: 3
+    name: DNS lookup
+    description: The sample tried to resolve a domain name during emulation (informational; the domain is tagged for reputation checks).
+    filetype: ".*"
+    score: 0
+    attack_id: T1071.004
+  - heur_id: 4
+    name: Data sent to remote host
+    description: The bytes the sample tried to send to a remote host (e.g. a C2 registration message).
+    filetype: ".*"
+    score: 0
+  - heur_id: 5
+    name: Suspicious process behaviour
+    description: The sample forked/daemonised, renamed itself, executed another program, killed processes or probed for a debugger.
+    filetype: ".*"
+    score: 0
+    max_score: 500
+    signature_score_map:
+      execve: 300
+      kill_process: 100
+      anti_debug: 100
+      daemonize: 0
+      process_rename: 0
+  - heur_id: 6
+    name: Suspicious file system activity
+    description: The sample dropped a file, made it executable, deleted itself or opened a hardware watchdog device.
+    filetype: ".*"
+    score: 0
+    max_score: 500
+    signature_score_map:
+      made_executable: 300
+      self_delete: 100
+      watchdog_access: 100
+      dropped_file: 0
+  - heur_id: 7
+    name: Emulation stopped on a CPU fault
+    description: Emulation hit an unmapped memory access or unsupported instruction and stopped early.
+    filetype: ".*"
+    score: 0
+
+docker_config:
+  image: kylemc54321/assemblyline-service-elfsim:$SERVICE_TAG
+  cpu_cores: 1
+  ram_mb_min: 512
+  ram_mb: 1024
+  allow_internet_access: false

@@ -1,0 +1,394 @@
+{
+  "extra": {
+    "drop_file": false,
+    "score": 900,
+    "sections": [
+      {
+        "auto_collapse": false,
+        "body": {
+          "architecture": "x86",
+          "entry_point": "0x8048100",
+          "runtime_seconds": 0.0,
+          "stopped_because": "sample exited (exit code 0)",
+          "syscalls_emulated": 14
+        },
+        "body_config": {},
+        "body_format": "KEY_VALUE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [],
+          "frequency": 1,
+          "heur_id": 1,
+          "score": 0,
+          "score_map": {},
+          "signatures": {
+            "emulation_completed": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {},
+        "title_text": "Emulation summary",
+        "zeroize_on_tag_safe": false
+      },
+      {
+        "auto_collapse": false,
+        "body": [
+          {
+            "address": "198.51.100.7",
+            "note": "",
+            "operation": "connect",
+            "port": 4444,
+            "protocol": "tcp",
+            "times": 1
+          }
+        ],
+        "body_config": {
+          "column_order": [
+            "operation",
+            "protocol",
+            "address",
+            "port",
+            "times",
+            "note"
+          ]
+        },
+        "body_format": "TABLE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [
+            "T1095"
+          ],
+          "frequency": 1,
+          "heur_id": 2,
+          "score": 100,
+          "score_map": {},
+          "signatures": {
+            "tcp_connect": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {
+          "network": {
+            "dynamic": {
+              "ip": [
+                "198.51.100.7"
+              ]
+            },
+            "port": [
+              "4444"
+            ],
+            "protocol": [
+              "tcp"
+            ]
+          }
+        },
+        "title_text": "Network connections attempted (simulated, no real traffic)",
+        "zeroize_on_tag_safe": false
+      },
+      {
+        "auto_collapse": false,
+        "body": [
+          {
+            "domain": "c2.test",
+            "record_type": 1,
+            "times": 1
+          }
+        ],
+        "body_config": {
+          "column_order": [
+            "domain",
+            "record_type",
+            "times"
+          ]
+        },
+        "body_format": "TABLE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [
+            "T1071.004"
+          ],
+          "frequency": 1,
+          "heur_id": 3,
+          "score": 0,
+          "score_map": {},
+          "signatures": {
+            "dns_lookup": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {
+          "network": {
+            "dynamic": {
+              "domain": [
+                "c2.test"
+              ]
+            }
+          }
+        },
+        "title_text": "DNS lookups (answered with a documentation-range sinkhole)",
+        "zeroize_on_tag_safe": false
+      },
+      {
+        "auto_collapse": false,
+        "body": [
+          {
+            "bytes": 8,
+            "destination": "tcp://198.51.100.7:4444",
+            "preview": "48454c4c4f2d4332  |HELLO-C2|",
+            "times": 1
+          },
+          {
+            "bytes": 25,
+            "destination": "udp://203.0.113.53:53",
+            "preview": "42420100000100000000000002633204746573740000010001  |BB...........c2.test.....|",
+            "times": 1
+          }
+        ],
+        "body_config": {
+          "column_order": [
+            "destination",
+            "bytes",
+            "times",
+            "preview"
+          ]
+        },
+        "body_format": "TABLE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [],
+          "frequency": 1,
+          "heur_id": 4,
+          "score": 0,
+          "score_map": {},
+          "signatures": {
+            "data_sent": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {},
+        "title_text": "Data the sample sent (first bytes; hex | ascii)",
+        "zeroize_on_tag_safe": false
+      },
+      {
+        "auto_collapse": false,
+        "body": [
+          {
+            "action": "process renamed",
+            "detail": "scanbot",
+            "times": 1
+          },
+          {
+            "action": "execve",
+            "detail": "/bin/sh -c echo synthetic",
+            "times": 1
+          }
+        ],
+        "body_config": {
+          "column_order": [
+            "action",
+            "detail",
+            "times"
+          ]
+        },
+        "body_format": "TABLE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [],
+          "frequency": 1,
+          "heur_id": 5,
+          "score": 300,
+          "score_map": {},
+          "signatures": {
+            "execve": 1,
+            "process_rename": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {
+          "dynamic": {
+            "process": {
+              "command_line": [
+                "/bin/sh -c echo synthetic"
+              ]
+            }
+          }
+        },
+        "title_text": "Process activity",
+        "zeroize_on_tag_safe": false
+      },
+      {
+        "auto_collapse": false,
+        "body": [
+          {
+            "action": "file written",
+            "mode": "0o755",
+            "path": "/tmp/dropped.bin",
+            "size": 17
+          },
+          {
+            "action": "special file opened",
+            "mode": "",
+            "path": "/dev/watchdog",
+            "size": ""
+          },
+          {
+            "action": "file deleted",
+            "mode": "",
+            "path": "/tmp/sample",
+            "size": ""
+          }
+        ],
+        "body_config": {
+          "column_order": [
+            "action",
+            "path",
+            "size",
+            "mode"
+          ]
+        },
+        "body_format": "TABLE",
+        "classification": "TLP:C",
+        "depth": 0,
+        "heuristic": {
+          "attack_ids": [],
+          "frequency": 1,
+          "heur_id": 6,
+          "score": 500,
+          "score_map": {},
+          "signatures": {
+            "dropped_file": 1,
+            "made_executable": 1,
+            "self_delete": 1,
+            "watchdog_access": 1
+          }
+        },
+        "promote_to": null,
+        "tags": {},
+        "title_text": "File system activity (simulated, in memory)",
+        "zeroize_on_tag_safe": false
+      }
+    ]
+  },
+  "files": {
+    "extracted": [
+      {
+        "name": "dropped.bin",
+        "sha256": "6beaaf0f7043d43b156be32b40087a6db4b24f21580d958c19eb4b8fcd2fc3ae"
+      }
+    ],
+    "supplementary": [
+      {
+        "name": "elfsim_report.json",
+        "sha256": "d4f2103cd20e056f6d274e4966c29aaac95ae89bf80baea43e4606467ea8dc30"
+      }
+    ]
+  },
+  "results": {
+    "heuristics": [
+      {
+        "attack_ids": [],
+        "heur_id": 1,
+        "signatures": [
+          "emulation_completed"
+        ]
+      },
+      {
+        "attack_ids": [
+          "T1095"
+        ],
+        "heur_id": 2,
+        "signatures": [
+          "tcp_connect"
+        ]
+      },
+      {
+        "attack_ids": [
+          "T1071.004"
+        ],
+        "heur_id": 3,
+        "signatures": [
+          "dns_lookup"
+        ]
+      },
+      {
+        "attack_ids": [],
+        "heur_id": 4,
+        "signatures": [
+          "data_sent"
+        ]
+      },
+      {
+        "attack_ids": [],
+        "heur_id": 5,
+        "signatures": [
+          "process_rename",
+          "execve"
+        ]
+      },
+      {
+        "attack_ids": [],
+        "heur_id": 6,
+        "signatures": [
+          "dropped_file",
+          "made_executable",
+          "watchdog_access",
+          "self_delete"
+        ]
+      }
+    ],
+    "tags": {
+      "dynamic.process.command_line": [
+        {
+          "heur_id": 5,
+          "signatures": [
+            "process_rename",
+            "execve"
+          ],
+          "value": "/bin/sh -c echo synthetic"
+        }
+      ],
+      "network.dynamic.domain": [
+        {
+          "heur_id": 3,
+          "signatures": [
+            "dns_lookup"
+          ],
+          "value": "c2.test"
+        }
+      ],
+      "network.dynamic.ip": [
+        {
+          "heur_id": 2,
+          "signatures": [
+            "tcp_connect"
+          ],
+          "value": "198.51.100.7"
+        }
+      ],
+      "network.port": [
+        {
+          "heur_id": 2,
+          "signatures": [
+            "tcp_connect"
+          ],
+          "value": "4444"
+        }
+      ],
+      "network.protocol": [
+        {
+          "heur_id": 2,
+          "signatures": [
+            "tcp_connect"
+          ],
+          "value": "tcp"
+        }
+      ]
+    },
+    "temp_submission_data": {}
+  }
+}
