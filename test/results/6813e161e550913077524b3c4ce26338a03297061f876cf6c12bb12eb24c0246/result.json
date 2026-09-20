@@ -259,6 +259,10 @@
       {
         "name": "dropped.bin",
         "sha256": "6beaaf0f7043d43b156be32b40087a6db4b24f21580d958c19eb4b8fcd2fc3ae"
+      },
+      {
+        "name": "emulated_command_0.sh",
+        "sha256": "e8c589cde2185fa68d06db170a541318c56d37d0929c8eb31ab0c81f063d808c"
       }
     ],
     "supplementary": [

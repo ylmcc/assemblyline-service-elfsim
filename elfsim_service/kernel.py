@@ -621,6 +621,13 @@ class FakeKernel:
     sys_vfork = sys_fork
 
     def sys_clone(self, flags, stack=0, ptid=0, a3=0, a4=0, *_):
+        if flags & CLONE_VM and not flags & CLONE_THREAD:
+            # posix_spawn()/system(): a vfork-style clone. Treat it as a fork; the child runs on the
+            # stack it was given, which is where the libc stub expects to find its function and args.
+            ret = self.sys_fork()
+            if ret == 0 and stack:
+                self.uc.reg_write(self.arch.sp_reg, stack)
+            return ret
         if flags & CLONE_VM:
             if flags & CLONE_THREAD and self.arch.clone_tls_arg is not None:
                 if len(self.threads) >= MAX_THREADS:

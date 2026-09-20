@@ -29,6 +29,7 @@ MAX_ROWS = 30
 MAX_CONVERSATIONS = 8
 MAX_TRANSCRIPT_LINES = 25
 MAX_EXTRACTED = 10
+SHELLS = ("sh", "bash", "dash", "ash", "busybox")
 PAYLOAD_MIN_BYTES = 64          # a received stream at least this big is extracted as a payload
 RECONNECT_THRESHOLD = 5
 _LOCAL_NETS = [ipaddress.ip_network(n) for n in
@@ -110,6 +111,7 @@ class ElfSim(ServiceBase):
         self._sent_data(result, report)
         self._received(request, result, report)
         self._processes(result, report, argv)
+        self._scripts(request, report)
         self._files(request, result, report, argv)
         self._fault(result, report)
         request.result = result
@@ -311,6 +313,26 @@ class ElfSim(ServiceBase):
             table.add_tag("dynamic.process.command_line", cmd)
         table.set_heuristic(heur)
         result.add_section(table)
+
+    def _scripts(self, request: ServiceRequest, report) -> None:
+        """Every `sh -c <command>` the sample tried to run becomes an extracted script, so AL routes
+        it to BashSim / PayloadFetcher (URLs, download-and-run chains). A command that is still a
+        template (a literal %s) has no URL yet; it only gets one from a live C2."""
+        commands: list = []
+        for e in report.events:
+            argv = e.get("argv") or []
+            if (e["kind"] == "process" and e["syscall"] == "execve" and "-c" in argv[:-1]
+                    and os.path.basename(argv[0]) in SHELLS):
+                cmd = argv[argv.index("-c") + 1]
+                if cmd not in commands:
+                    commands.append(cmd)
+        for i, cmd in enumerate(commands[:MAX_EXTRACTED]):
+            path = os.path.join(self.working_directory, f"emulated_command_{i}.sh")
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + cmd + "\n")
+            request.add_extracted(path, f"emulated_command_{i}.sh",
+                                  "Shell command the sample tried to run (execve sh -c), recovered during emulation",
+                                  parent_relation=PARENT_RELATION.DYNAMIC)
 
     def _files(self, request: ServiceRequest, result: Result, report, argv: list) -> None:
         rows: list = []

