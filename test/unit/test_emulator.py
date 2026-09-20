@@ -243,3 +243,13 @@ def test_recvfrom_reports_the_sender_so_resolvers_accept_the_answer():
     p.sys(4, 1, src, 8)
     p.exit(0)
     assert _run(p).stdout == struct.pack("<H", 2) + struct.pack(">H", 53) + bytes([203, 0, 113, 53])
+
+
+def test_readlink_of_proc_self_exe_returns_the_programs_own_path():
+    p = Prog()
+    link, buf = p.cstr("/proc/self/exe"), p.d(b"\0" * 64)
+    p.sys(85, link, buf, 63)                     # readlink(path, buf, size) -> length in eax
+    p.edx_from_eax()
+    p.sys(4, 1, buf)                             # write(1, buf, edx)
+    p.exit(0)
+    assert emulate(p.build(), argv=["/tmp/robben"], timeout_s=10).stdout == b"/tmp/robben"

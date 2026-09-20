@@ -194,6 +194,7 @@ class FakeKernel:
         self.syscall_count = 0
 
         self.pid, self.ppid = 1000, 1
+        self.exe_path = "/tmp/sample"   # what /proc/self/exe points at (argv[0])
         self.threads: list = [Thread(tid=self.pid)]
         self.cur: Thread = self.threads[0]
         self.switch_to: Optional[Thread] = None   # thread the run loop must activate next
@@ -1290,8 +1291,17 @@ class FakeKernel:
         known = p in self.files or p in FAKE_DIRS or p in STATIC_FILES or p.startswith("/dev/")
         return 0 if known else -ENOENT
 
-    def sys_readlink(self, *_):
+    def sys_readlink(self, path, buf, size, *_):
+        # Programs find their own binary through /proc/self/exe (to copy, delete or re-launch it);
+        # answering ENOENT leaves them building paths from an uninitialised buffer.
+        if self._norm(self.cstr(path)) in ("/proc/self/exe", f"/proc/{self.pid}/exe"):
+            data = self.exe_path.encode("latin-1")[:size]
+            self.write(buf, data)
+            return len(data)
         return -ENOENT
+
+    def sys_readlinkat(self, dirfd, path, buf, size, *_):
+        return self.sys_readlink(path, buf, size)
 
     def _fill_stat(self, buf: int, mode: int, size: int, is64: bool) -> None:
         mode_off, mode_bytes, size_off, total = self.arch.stat64 if is64 else self.arch.stat32

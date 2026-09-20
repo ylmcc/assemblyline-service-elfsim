@@ -197,6 +197,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
 
     kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=stack_top - STACK_SIZE,
                         max_syscalls=max_syscalls, live_net=network)
+    kernel.exe_path = argv[0]
     report = EmulationReport(arch=arch.name, entry=entry, warnings=warnings)
     fault: dict = {}
 
