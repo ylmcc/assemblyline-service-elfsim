@@ -20,9 +20,20 @@ import json
 import os
 import select
 import socket
+import subprocess
 import threading
 import time
 from typing import Optional
+
+
+def _route_dev(ip: str) -> Optional[str]:
+    """Network device the kernel would use to reach ``ip`` right now (local lookup, sends nothing)."""
+    try:
+        out = subprocess.run(["ip", "-o", "route", "get", ip], capture_output=True, text=True,
+                             timeout=3).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[out.index("dev") + 1] if "dev" in out else None
 
 
 # ============================================================================ client
@@ -125,8 +136,9 @@ class RelayServer:
     def __init__(self, allow: set, capture_path: str, *, max_sessions: int = 5,
                  max_session_seconds: float = 60.0, max_inbound: int = 1 << 20,
                  max_outbound: int = 1 << 16, connect_timeout: float = 8.0,
-                 allow_private: bool = False) -> None:
+                 allow_private: bool = False, require_dev: Optional[str] = None) -> None:
         self.allow = set(allow)
+        self.require_dev = require_dev  # refuse unless the route to the target uses this device (e.g. a VPN)
         self.capture_path = capture_path
         self.max_sessions = max_sessions
         self.max_session_seconds = max_session_seconds
@@ -155,6 +167,10 @@ class RelayServer:
             return "not an IP literal"
         if not self.allow_private and not addr.is_global:
             return "non-global address refused"
+        if self.require_dev:
+            dev = _route_dev(ip)
+            if dev != self.require_dev:
+                return f"route goes via {dev or 'unknown'}, not {self.require_dev}"
         return None
 
     def handle(self, client: socket.socket) -> None:
@@ -287,10 +303,12 @@ def main() -> None:
     sv.add_argument("--max-session-seconds", type=float, default=60.0)
     sv.add_argument("--max-inbound", type=int, default=1 << 20)
     sv.add_argument("--allow-private", action="store_true", help="tests only")
+    sv.add_argument("--require-dev", help="refuse to connect unless the route to the target uses this "
+                                          "network device (e.g. nordtun), so a dropped VPN cannot leak")
     a = ap.parse_args()
     RelayServer(set(a.allow), a.capture, max_sessions=a.max_sessions,
                 max_session_seconds=a.max_session_seconds, max_inbound=a.max_inbound,
-                allow_private=a.allow_private).serve(a.socket)
+                allow_private=a.allow_private, require_dev=a.require_dev).serve(a.socket)
 
 
 if __name__ == "__main__":

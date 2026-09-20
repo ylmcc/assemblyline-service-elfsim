@@ -175,3 +175,14 @@ def test_unreachable_relay_makes_connect_fail_instead_of_pretending(tmp_path, re
                 relay=RelayClient(str(tmp_path / "missing.sock"), {f"127.0.0.1:{remote.port}"}))
     connect = next(e for e in r.events if e["syscall"] == "connect")
     assert connect["relayed"] is False and r.received == []
+
+
+def test_relay_refuses_to_connect_when_the_route_is_not_via_the_required_device(tmp_path, remote, monkeypatch):
+    ep = f"127.0.0.1:{remote.port}"
+    server, path = _start_relay(tmp_path, {ep}, require_dev="nordtun")
+    monkeypatch.setattr("elfsim_service.relay._route_dev", lambda ip: "wlp12s0")   # VPN "dropped"
+    assert RelayClient(path, {ep}).open("127.0.0.1", remote.port) is None
+    assert any("not nordtun" in r.get("note", "") for r in _capture(tmp_path))
+    monkeypatch.setattr("elfsim_service.relay._route_dev", lambda ip: "nordtun")   # VPN back
+    assert RelayClient(path, {ep}).open("127.0.0.1", remote.port) is not None
+    server.stop()
