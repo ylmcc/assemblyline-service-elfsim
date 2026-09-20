@@ -49,6 +49,7 @@ class EmulationReport:
     file_modes: dict = field(default_factory=dict)  # path -> last chmod mode
     stdout: bytes = b""
     sent: list = field(default_factory=list)
+    received: list = field(default_factory=list)  # bytes a relayed remote end sent back
     syscall_counts: dict = field(default_factory=dict)
     unknown_syscalls: dict = field(default_factory=dict)
     syscalls_total: int = 0
@@ -76,7 +77,8 @@ def _describe_fault(uc: Uc, arch: Arch, e: UcError) -> dict:
 
 
 def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int = 50_000_000,
-            timeout_s: float = 30.0, max_syscalls: int = 200_000) -> EmulationReport:
+            timeout_s: float = 30.0, max_syscalls: int = 200_000,
+            relay=None) -> EmulationReport:
     started = time.monotonic()
     try:
         elf = ELFFile(io.BytesIO(data))
@@ -153,7 +155,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     uc.reg_write(arch.sp_reg, sp)
 
     kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=STACK_TOP - STACK_SIZE,
-                        max_syscalls=max_syscalls)
+                        max_syscalls=max_syscalls, relay=relay)
     report = EmulationReport(arch=arch.name, entry=entry)
     fault: dict = {}
 
@@ -209,6 +211,9 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     report.file_modes = dict(kernel.file_modes)
     report.stdout = bytes(kernel.stdout)
     report.sent = kernel.sent
+    report.received = kernel.received
+    if relay is not None:
+        relay.close_all()
     report.syscall_counts = dict(kernel.counts)
     report.unknown_syscalls = dict(kernel.unknown_syscalls)
     report.syscalls_total = kernel.syscall_count

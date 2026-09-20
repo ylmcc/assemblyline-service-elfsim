@@ -27,6 +27,9 @@ MAX_STDOUT = 64 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_FILES = 50
 MAX_FORKS = 16
+MAX_RECEIVED_ENTRIES = 200
+MAX_RECEIVED_BYTES = 2 * 1024 * 1024
+RELAY_MAX_WAIT = 2.0  # real seconds a select()/recv() will wait for relayed data
 MAX_PATH_SYSCALLS = 20_000  # per forked path, so an idle daemon loop can't starve the parent path
 MAX_MAPPED_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; larger address spaces are only partly restored
@@ -36,7 +39,7 @@ MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; larger address spaces are onl
 SINKHOLE_IP = "192.0.2.53"
 
 EPERM, ENOENT, EBADF, EAGAIN, ENOMEM, EFAULT = 1, 2, 9, 11, 12, 14
-ENODEV, EINVAL, ENOTTY, EFBIG, ENOSYS, EAFNOSUPPORT = 19, 22, 25, 27, 38, 97
+ENODEV, EINVAL, ENOTTY, EFBIG, ENOSYS, EAFNOSUPPORT, EPIPE, ECONNREFUSED = 19, 22, 25, 27, 38, 97, 32, 111
 
 O_ACCMODE, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND = 3, 1, 2, 0o100, 0o1000, 0o2000
 MAP_FIXED, MAP_ANONYMOUS = 0x10, 0x20
@@ -109,6 +112,7 @@ class Sock:
     proto: int
     remote: Optional[dict] = None
     recv_queue: deque = field(default_factory=deque)
+    relay: Optional[object] = None  # RelaySession when this stream is relayed to a real endpoint
 
 
 @dataclass
@@ -119,11 +123,14 @@ class Pipe:
 class FakeKernel:
     def __init__(self, uc, arch: Arch, *, brk_base: int, stack_low: int,
                  max_syscalls: int = 200_000, max_path_syscalls: int = MAX_PATH_SYSCALLS,
-                 seed: int = 0x5EED) -> None:
+                 relay=None, seed: int = 0x5EED) -> None:
         self.uc = uc
         self.arch = arch
         self.max_syscalls = max_syscalls
         self.max_path_syscalls = max_path_syscalls
+        self.relay = relay  # optional RelayClient; None = fully simulated network
+        self.received: list[dict] = []
+        self._received_bytes = 0
         self.path_syscalls = 0
         self.stack_low = stack_low
         self.rng = random.Random(seed)
@@ -644,7 +651,11 @@ class FakeKernel:
             data = bytes(obj.data[obj.pos:obj.pos + n])
             obj.pos += len(data)
         elif isinstance(obj, Sock):
-            if obj.recv_queue:
+            if obj.relay is not None and not obj.recv_queue:
+                data = self._relay_recv(obj, n)
+                if data is None:
+                    return -EAGAIN
+            elif obj.recv_queue:
                 data = self._pop_queue(obj, n)
             else:
                 return 0 if obj.type == SOCK_STREAM else -EAGAIN
@@ -655,6 +666,19 @@ class FakeKernel:
             return -EBADF
         self.write(buf, data)
         return len(data)
+
+    def _relay_recv(self, sock: Sock, n: int) -> Optional[bytes]:
+        """Receive from a relayed stream, really waiting (bounded) like a blocking recv would."""
+        data = sock.relay.recv(n)
+        if data is None:
+            self.vtime += self.relay.wait_any([sock.relay], RELAY_MAX_WAIT)
+            data = sock.relay.recv(n)
+        if data:  # keep what the remote end sent: this is the intel the relay exists for
+            if len(self.received) < MAX_RECEIVED_ENTRIES and self._received_bytes < MAX_RECEIVED_BYTES:
+                self._received_bytes += len(data)
+                remote = sock.remote or {}
+                self.received.append({"ip": remote.get("ip"), "port": remote.get("port"), "data": data})
+        return data
 
     @staticmethod
     def _pop_queue(sock: Sock, n: int) -> bytes:
@@ -894,8 +918,18 @@ class FakeKernel:
         if "ip" in remote:
             proto = "udp" if sock.type == SOCK_DGRAM else "tcp"
             self.network.append({"op": "connect", "proto": proto, **remote})
+            if (proto == "tcp" and self.relay is not None
+                    and self.relay.allows(remote["ip"], remote["port"])):
+                session = self.relay.open(remote["ip"], remote["port"])
+                if session is None:
+                    self.log("network", "connect", proto=proto, relayed=False,
+                             note="relay refused or unreachable", **remote)
+                    return -ECONNREFUSED
+                sock.relay = session
+                self.log("network", "connect", proto=proto, relayed=True, **remote)
+                return 0
             self.log("network", "connect", proto=proto, **remote)
-        return 0  # always "succeeds" so the sample carries on to its next stage
+        return 0  # otherwise always "succeeds" so the sample carries on to its next stage
 
     def sys_bind(self, fd, addr, alen, *_):
         sock = self.fds.get(s32(fd))
@@ -949,6 +983,8 @@ class FakeKernel:
             self._sent_bytes += len(keep)
             self.sent.append({"proto": proto, "ip": remote.get("ip"), "port": remote.get("port"),
                               "size": len(data), "data": keep})
+        if sock.relay is not None and dest is None:
+            return len(data) if sock.relay.send(data) >= 0 else -EPIPE
         if proto == "udp" and remote.get("port") == 53:
             self._answer_dns(sock, data)
         return len(data)
@@ -1009,12 +1045,28 @@ class FakeKernel:
     def _readable(self, fd: int) -> bool:
         obj = self.fds.get(fd)
         if isinstance(obj, Sock):
-            return bool(obj.recv_queue)
+            return bool(obj.recv_queue) or (obj.relay is not None and obj.relay.readable())
         if isinstance(obj, Pipe):
             return bool(obj.buf)
         return isinstance(obj, OpenFile) or (isinstance(obj, Device) and obj.name == "urandom")
 
+    def _relay_idle_wait(self, read_fds, timeout_s: float) -> None:
+        """If a relayed stream is being watched and nothing is readable yet, really wait for it
+        (bounded) so a reply from the remote end isn't missed by racing ahead in virtual time."""
+        relayed = [self.fds[fd].relay for fd in read_fds
+                   if isinstance(self.fds.get(fd), Sock) and self.fds[fd].relay is not None
+                   and not self.fds[fd].relay.closed]
+        if relayed and not any(self._readable(fd) for fd in read_fds):
+            self.vtime += self.relay.wait_any(relayed, min(timeout_s, RELAY_MAX_WAIT))
+
     def sys_poll(self, fds, nfds, timeout, *_):
+        if self.relay is not None and s32(timeout) > 0:
+            watch = []
+            for i in range(min(nfds, 1024)):
+                fd, events, _r = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
+                if fd >= 0 and events & POLLIN:
+                    watch.append(fd)
+            self._relay_idle_wait(watch, s32(timeout) / 1000)
         ready = 0
         for i in range(min(nfds, 1024)):
             fd, events, _rev = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
@@ -1033,6 +1085,11 @@ class FakeKernel:
     def sys__newselect(self, n, rfds, wfds, efds, timeout, *_):
         n = min(n, 1024)
         nlongs = (n + 31) // 32
+        if self.relay is not None and timeout and rfds:
+            sec, usec = struct.unpack("<II", self.read(timeout, 8))
+            words = struct.unpack(f"<{nlongs}I", self.read(rfds, 4 * nlongs))
+            watch = [fd for fd in range(n) if words[fd // 32] >> (fd % 32) & 1]
+            self._relay_idle_wait(watch, sec + usec / 1e6)
         ready = 0
         for ptr, kind in ((rfds, "r"), (wfds, "w"), (efds, "e")):
             if not ptr:
