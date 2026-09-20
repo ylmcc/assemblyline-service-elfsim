@@ -41,7 +41,10 @@ class Arch:
     word_size: int = 4
     elfclass: int = 32                        # ELFCLASS the loader must see (32 or 64)
     syscall_hook: str = "intr"                # "intr": UC_HOOK_INTR (int 0x80 / MIPS syscall); "insn_syscall": UC_HOOK_INSN on x86-64 `syscall`
+    syscall_insn_len: int = 0                 # x86-64: inside the syscall hook RIP is still AT the 2-byte instruction
     select_takes_struct: bool = True          # old i386 select(2) takes ONE pointer to its 5 arguments
+    clone_tls_arg: Optional[int] = None       # index of clone()'s TLS argument; None = threads not emulated
+    epoll_event_packed: bool = True           # struct epoll_event is packed (12 bytes) on x86, 16 on MIPS
     # ---- ABI differences. Defaults describe Linux/i386; the fake kernel works in i386
     # ("canonical") constants and translates at the edges using these.
     stack_arg_offset: Optional[int] = None   # syscall args beyond len(arg_regs) live on the stack here
@@ -143,6 +146,7 @@ MIPSEL = Arch(
     stat64=(24, 4, 56, 104),
     stat32=(20, 4, 48, 88),
     old_mmap_struct=False,
+    epoll_event_packed=False,
     pipe_second_reg=UC_MIPS_REG_V1,
     set_tls=lambda uc, addr: uc.reg_write(UC_MIPS_REG_CP0_USERLOCAL, addr),
     entry_regs={UC_MIPS_REG_T9: "entry"},
@@ -171,7 +175,9 @@ X86_64 = Arch(
     word_size=8,
     elfclass=64,
     syscall_hook="insn_syscall",
+    syscall_insn_len=2,
     select_takes_struct=False,
+    clone_tls_arg=4,                             # clone(flags, stack, ptid, ctid, tls)
     old_mmap_struct=False,
     stat64=(24, 4, 48, 144),
     stat32=(24, 4, 48, 144),

@@ -56,6 +56,10 @@ class X64Prog(Prog):
     def load_stack_word(self, offset: int) -> None:
         self.code += b"\x48\x8b\x44\x24" + bytes([offset])           # mov rax, [rsp+offset]
 
+    def spin_until_nonzero(self, addr: int) -> None:
+        self.mov(RBX, addr)
+        self.code += b"\x83\x3b\x00\x74\xfb"      # L: cmp dword [rbx], 0 ; je L
+
     def load_fs0(self) -> None:
         self.code += b"\x64\x48\x8b\x04\x25\x00\x00\x00\x00"   # mov rax, fs:[0]
 

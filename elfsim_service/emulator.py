@@ -19,6 +19,7 @@ from elfsim_service.kernel import PAGE, FakeKernel
 
 STACK_SIZE = 0x100000
 MAX_IMAGE_BYTES = 128 * 1024 * 1024
+THREAD_SLICE = 500_000                    # instructions a thread runs before others get a turn
 
 AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY = 0, 3, 4, 5, 6, 9
 AT_UID, AT_EUID, AT_GID, AT_EGID, AT_RANDOM = 11, 12, 13, 14, 25
@@ -55,6 +56,7 @@ class EmulationReport:
     syscalls_total: int = 0
     open_counts: dict = field(default_factory=dict)  # most-opened paths (diagnostics)
     elapsed: float = 0.0
+    threads_created: int = 0
     warnings: list = field(default_factory=list)  # oddities in the file itself (e.g. truncated segments)
 
 
@@ -212,21 +214,30 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     # ---- run. Each emu_start segment ends on exit, execve, a limit, or a fork rewind.
     deadline = started + timeout_s
     pc = entry
+    thread_budget = max_instructions      # shared by all threads, consumed slice by slice
     while True:
         if kernel.resume is not None:  # rewind to the parent of a finished/abandoned fork
             record, kernel.resume = kernel.resume, None
             pc = kernel.rewind(record)
+        elif kernel.switch_to is not None:       # a syscall blocked/yielded: hand the CPU to another thread
+            pc = kernel.activate_thread()
         remaining_us = int((deadline - time.monotonic()) * 1_000_000)
         if remaining_us <= 0:
             report.stop_reason = "timeout"
             break
+        threaded = len(kernel.threads) > 1
+        count = min(THREAD_SLICE, thread_budget) if threaded else max_instructions
         try:
-            uc.emu_start(pc, 0, timeout=remaining_us, count=max_instructions)
+            uc.emu_start(pc, 0, timeout=remaining_us, count=count)
         except UcError as e:
             report.error = _describe_fault(uc, arch, e)
             report.stop_reason = "fault"
             break
-        if kernel.resume is not None:
+        if kernel.resume is not None or kernel.switch_to is not None:
+            continue
+        if kernel.replan:                         # a thread was just created: continue this one, now sliced
+            kernel.replan = False
+            pc = uc.reg_read(arch.pc_reg)
             continue
         if kernel.stop_reason:
             report.stop_reason = kernel.stop_reason
@@ -234,6 +245,13 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         if time.monotonic() >= deadline:
             report.stop_reason = "timeout"
             break
+        if threaded:                              # time slice used up: let the other threads run
+            thread_budget -= count
+            if thread_budget <= 0:
+                report.stop_reason = "instruction_limit"
+                break
+            kernel.yield_thread()
+            continue
         if kernel.has_pending_forks:
             kernel.abandon_path("instruction budget exhausted")
             pc = uc.reg_read(arch.pc_reg)
@@ -257,6 +275,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     report.syscall_counts = dict(kernel.counts)
     report.unknown_syscalls = dict(kernel.unknown_syscalls)
     report.syscalls_total = kernel.syscall_count
+    report.threads_created = kernel.threads_created
     report.open_counts = dict(kernel.open_counts.most_common(20))
     report.elapsed = time.monotonic() - started
     return report

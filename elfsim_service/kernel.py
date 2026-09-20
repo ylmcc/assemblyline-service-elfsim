@@ -42,10 +42,16 @@ SINKHOLE_IP = "192.0.2.53"
 
 EPERM, ENOENT, EBADF, EAGAIN, ENOMEM, EFAULT = 1, 2, 9, 11, 12, 14
 ENODEV, EINVAL, ENOTTY, EFBIG, ENOSYS, EAFNOSUPPORT, EPIPE, ECONNREFUSED = 19, 22, 25, 27, 38, 97, 32, 111
+ETIMEDOUT, EEXIST = 110, 17
+EPOLLIN, EPOLLOUT, EPOLLET = 0x1, 0x4, 1 << 31
+EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD = 1, 2, 3
 
 O_ACCMODE, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND = 3, 1, 2, 0o100, 0o1000, 0o2000
 MAP_FIXED, MAP_ANONYMOUS = 0x10, 0x20
 CLONE_VM = 0x100
+CLONE_THREAD, CLONE_SETTLS, CLONE_PARENT_SETTID = 0x10000, 0x80000, 0x100000
+CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID = 0x200000, 0x1000000
+MAX_THREADS = 64
 SOCK_STREAM, SOCK_DGRAM, SOCK_RAW = 1, 2, 3
 AF_UNIX, AF_INET, AF_NETLINK, AF_INET6 = 1, 2, 16, 10
 POLLIN, POLLOUT = 1, 4
@@ -92,6 +98,34 @@ def s32(v: int) -> int:
 
 class Fault(Exception):
     """A guest pointer could not be read/written: the syscall returns -EFAULT."""
+
+
+@dataclass
+class Thread:
+    """One emulated thread. Threads are cooperative: the running one keeps the CPU until it blocks
+    or yields, so nothing runs in parallel and results stay deterministic."""
+    tid: int
+    ctx: object = None                    # saved CPU context while not running
+    state: str = "ready"                  # ready (running or runnable) | futex | sleep | dead
+    wait_addr: Optional[int] = None
+    wake_at: Optional[float] = None       # virtual-clock deadline for a timed wait/sleep
+    pending_ret: Optional[int] = None     # value the blocked syscall returns when it resumes
+    setup: Optional[dict] = None          # first-run register setup for a freshly cloned thread
+    clear_tid: int = 0                    # CLONE_CHILD_CLEARTID / set_tid_address word
+    seq: int = 0                          # order in which threads blocked (FIFO futex wake-up)
+    restart: bool = False                 # woken by readiness: re-run the blocked syscall
+    restart_nr: int = 0                   # ...whose syscall number was this
+
+
+@dataclass
+class EventFd:
+    counter: int = 0
+
+
+@dataclass
+class Epoll:
+    watch: dict = field(default_factory=dict)      # fd -> [event mask, user data]
+    reported: set = field(default_factory=set)     # edge-triggered fds already reported as ready
 
 
 @dataclass
@@ -157,6 +191,12 @@ class FakeKernel:
         self.syscall_count = 0
 
         self.pid, self.ppid = 1000, 1
+        self.threads: list = [Thread(tid=self.pid)]
+        self.cur: Thread = self.threads[0]
+        self.switch_to: Optional[Thread] = None   # thread the run loop must activate next
+        self.replan = False                       # run loop should recompute its time slice and continue
+        self.threads_created = 0
+        self._block_seq = 0
         self.epoch = 1_700_000_000
         self.vtime = 0.0  # seconds slept so far; advances the fake clock
         self.cwd = "/"
@@ -379,6 +419,16 @@ class FakeKernel:
             uc.reg_write(arch.error_flag_reg, 0)
         uc.reg_write(arch.ret_reg, ret & mask)
 
+    def _save_ctx(self):
+        """Snapshot the CPU from inside a syscall hook so that resuming continues AFTER the syscall.
+        On x86-64 the hook runs with RIP still at the `syscall` instruction; without this fix a
+        restored context would execute the syscall a second time."""
+        ctx = self.uc.context_save()
+        if self.arch.syscall_insn_len:
+            ctx.reg_write(self.arch.pc_reg,
+                          self.uc.reg_read(self.arch.pc_reg) + self.arch.syscall_insn_len)
+        return ctx
+
     def _stop(self, reason: str) -> None:
         self.stop_reason = self.stop_reason or reason
         self.uc.emu_stop()
@@ -431,6 +481,89 @@ class FakeKernel:
                  syscalls_on_path=self.path_syscalls)
         self._end_process("path_abandoned")
 
+    # ---------------------------------------------------------------- threads
+    def _wake_due(self) -> None:
+        for t in self.threads:
+            if t.state in ("futex", "sleep", "epoll") and t.wake_at is not None and t.wake_at <= self.vtime + 1e-12:
+                t.pending_ret = -ETIMEDOUT if t.state == "futex" else 0
+                t.state, t.wait_addr, t.wake_at = "ready", None, None
+
+    def _pick_next(self) -> Optional[Thread]:
+        self._wake_due()
+        n, i = len(self.threads), self.threads.index(self.cur)
+        for step in range(1, n + 1):              # round-robin, the current thread last
+            t = self.threads[(i + step) % n]
+            if t.state == "ready":
+                return t
+        timed = [t for t in self.threads if t.state in ("futex", "sleep", "epoll") and t.wake_at is not None]
+        if not timed:
+            return None
+        self.vtime = max(self.vtime, min(t.wake_at for t in timed))   # nothing can run: time passes
+        self._wake_due()
+        return self._pick_next()
+
+    def _request_switch(self) -> None:
+        nxt = self._pick_next()
+        if nxt is None:                           # every thread is blocked with nothing to wake it
+            self._stop("deadlock")
+            return
+        self.switch_to = nxt
+        self.uc.emu_stop()
+
+    def _block(self, state: str, addr: Optional[int] = None, until: Optional[float] = None) -> int:
+        cur = self.cur
+        cur.state, cur.wait_addr, cur.wake_at = state, addr, until
+        self._block_seq += 1
+        cur.seq = self._block_seq
+        self._request_switch()
+        return 0
+
+    def _wake_epoll_waiters(self) -> None:
+        """Something became readable: threads blocked in epoll_wait re-run it to collect events."""
+        for t in self.threads:
+            if t.state == "epoll":
+                t.state, t.wake_at, t.restart = "ready", None, True
+
+    def yield_thread(self) -> None:
+        """Give another runnable thread the CPU (time-slice expiry or sched_yield)."""
+        self.cur.state = "ready"
+        self._request_switch()
+
+    def _futex_wake(self, addr: int, count: int) -> int:
+        waiters = sorted((t for t in self.threads if t.state == "futex" and t.wait_addr == addr),
+                         key=lambda t: t.seq)[:count]
+        for t in waiters:
+            t.state, t.wait_addr, t.wake_at, t.pending_ret = "ready", None, None, None
+        return len(waiters)
+
+    def activate_thread(self) -> int:
+        """Called by the run loop after emu_stop(): swap CPU state to the requested thread."""
+        nxt, self.switch_to = self.switch_to, None
+        old = self.cur
+        if old.state != "dead":
+            old.ctx = self.uc.context_save()
+        if nxt.ctx is not None:
+            self.uc.context_restore(nxt.ctx)
+        if nxt.setup is not None:                 # first run: clone() returns 0 in the child
+            self.uc.reg_write(self.arch.ret_reg, 0)
+            if nxt.setup["sp"]:
+                self.uc.reg_write(self.arch.sp_reg, nxt.setup["sp"])
+            if nxt.setup["tls"] is not None and self.arch.set_tls is not None:
+                self.arch.set_tls(self.uc, nxt.setup["tls"])
+            nxt.setup = None
+        elif nxt.restart and self.arch.syscall_insn_len:      # re-run the epoll_wait it was blocked in
+            self.uc.reg_write(self.arch.nr_reg, nxt.restart_nr)
+            self.uc.reg_write(self.arch.pc_reg,
+                              self.uc.reg_read(self.arch.pc_reg) - self.arch.syscall_insn_len)
+        elif nxt.pending_ret is not None:
+            self._set_result(nxt.pending_ret)
+        nxt.restart = False
+        nxt.pending_ret, nxt.state, nxt.wait_addr, nxt.wake_at = None, "ready", None, None
+        if old.state == "dead":
+            self.threads.remove(old)
+        self.cur = nxt
+        return self.uc.reg_read(self.arch.pc_reg)
+
     def _end_process(self, how: str) -> None:
         """The current (possibly forked-child) process is over: rewind to the parent if we
         forked, otherwise the whole emulation is finished."""
@@ -442,11 +575,23 @@ class FakeKernel:
 
     # ---------------------------------------------------------------- process
     def sys_exit(self, code, *_):
+        if len(self.threads) > 1 and self.cur is not self.threads[0]:    # a worker thread ends
+            th = self.cur
+            th.state = "dead"
+            if th.clear_tid:
+                try:
+                    self.put32(th.clear_tid, 0)
+                except Fault:
+                    pass
+                self._futex_wake(th.clear_tid, 1)
+            self._request_switch()
+            return 0
+        return self.sys_exit_group(code)
+
+    def sys_exit_group(self, code, *_):
         self.log("process", "exit", code=s32(code))
         self._end_process(f"exit({s32(code)})")
         return 0
-
-    sys_exit_group = sys_exit
 
     def sys_fork(self, *_):
         if self._fork_total >= MAX_FORKS:
@@ -459,14 +604,36 @@ class FakeKernel:
         # parent path so both halves of `if (fork() == 0) {...}` are explored. CPU state,
         # memory and the fd table are snapshotted and restored, as a real fork copies them.
         # The fake filesystem and network log stay shared, as they would be on a real box.
-        self._forks.append({"ctx": self.uc.context_save(), "pid": pid, "snap": self._snapshot()})
+        self._forks.append({"ctx": self._save_ctx(), "pid": pid, "snap": self._snapshot()})
         self.log("process", "fork", child_pid=pid)
         return 0
 
     sys_vfork = sys_fork
 
-    def sys_clone(self, flags, *_):
+    def sys_clone(self, flags, stack=0, ptid=0, a3=0, a4=0, *_):
         if flags & CLONE_VM:
+            if flags & CLONE_THREAD and self.arch.clone_tls_arg is not None:
+                if len(self.threads) >= MAX_THREADS:
+                    return -EAGAIN
+                tid = self._next_pid
+                self._next_pid += 1
+                tls, ctid = (a4, a3) if self.arch.clone_tls_arg == 4 else (a3, a4)
+                th = Thread(tid=tid, ctx=self._save_ctx(), state="ready",
+                            setup={"sp": stack, "tls": tls if flags & CLONE_SETTLS else None})
+                if flags & CLONE_CHILD_CLEARTID:
+                    th.clear_tid = ctid
+                if flags & CLONE_PARENT_SETTID and ptid:
+                    self.put32(ptid, tid)
+                if flags & CLONE_CHILD_SETTID and ctid:
+                    self.put32(ctid, tid)
+                self.threads.append(th)
+                self.threads_created += 1
+                if len(self.threads) == 2:            # first extra thread: the running slice was planned
+                    self.replan = True                # for one thread, so stop and re-plan with time slicing
+                    self.uc.emu_stop()
+                if self.threads_created <= 8:
+                    self.log("process", "clone", note="thread created (cooperative scheduling)", tid=tid)
+                return tid
             tid = self._next_pid
             self._next_pid += 1
             self.log("process", "clone", note="thread creation not emulated", flags=hex(flags))
@@ -501,7 +668,7 @@ class FakeKernel:
         return self.pid
 
     def sys_gettid(self, *_):
-        return self.pid
+        return self.cur.tid
 
     def sys_getppid(self, *_):
         return self.ppid
@@ -535,14 +702,37 @@ class FakeKernel:
         self.log("process", "ptrace", note="anti-debug probe", request=request)
         return 0
 
-    def sys_set_tid_address(self, *_):
-        return self.pid
+    def sys_set_tid_address(self, addr=0, *_):
+        self.cur.clear_tid = addr
+        return self.cur.tid
 
     def sys_set_robust_list(self, *_):
         return 0
 
-    def sys_futex(self, *_):
-        return 0
+    def sys_futex(self, uaddr, op, val, timeout=0, uaddr2=0, val3=0, *_):
+        cmd = op & 0x7F
+        if cmd in (0, 9):                                     # FUTEX_WAIT / FUTEX_WAIT_BITSET
+            if self.u32(uaddr) != val & 0xFFFFFFFF:
+                return -EAGAIN
+            delay = None
+            if timeout:
+                delay = self._read_timespec(timeout)
+                if cmd == 9:                                  # WAIT_BITSET takes an absolute deadline
+                    delay = max(0.0, delay - self.now())
+            if len(self.threads) == 1:                        # nothing can ever wake us
+                if delay is None:
+                    return 0                                  # spurious wake-up keeps the program moving
+                self.vtime += delay
+                return -ETIMEDOUT
+            return self._block("futex", addr=uaddr, until=None if delay is None else self.vtime + delay)
+        if cmd in (1, 10):                                    # FUTEX_WAKE / FUTEX_WAKE_BITSET
+            return self._futex_wake(uaddr, val & 0xFFFFFFFF)
+        return -ENOSYS
+
+    def sys_tgkill(self, *_):
+        return 0                                              # runtimes signal their own threads (preemption)
+
+    sys_tkill = sys_tgkill
 
     def sys_times(self, buf, *_):
         if buf:
@@ -552,7 +742,81 @@ class FakeKernel:
     def sys_inotify_init(self, *_):
         return self._alloc_fd(Device("special"))
 
-    sys_epoll_create = sys_inotify_init
+    def sys_epoll_create1(self, *_):
+        return self._alloc_fd(Epoll())
+
+    sys_epoll_create = sys_epoll_create1
+
+    def sys_eventfd2(self, initval, flags=0, *_):
+        return self._alloc_fd(EventFd(initval))
+
+    sys_eventfd = sys_eventfd2
+
+    def sys_epoll_ctl(self, epfd, op, fd, event, *_):
+        ep = self.fds.get(s32(epfd))
+        if not isinstance(ep, Epoll):
+            return -EBADF
+        fd = s32(fd)
+        if op == EPOLL_CTL_DEL:
+            ep.watch.pop(fd, None)
+            ep.reported.discard(fd)
+            return 0
+        if fd not in self.fds:
+            return -EBADF
+        if (op == EPOLL_CTL_ADD) == (fd in ep.watch):
+            return -EEXIST if op == EPOLL_CTL_ADD else -ENOENT
+        layout = "<IQ" if self.arch.epoll_event_packed else "<IxxxxQ"
+        events, data = struct.unpack(layout, self.read(event, struct.calcsize(layout)))
+        ep.watch[fd] = [events, data]
+        ep.reported.discard(fd)
+        return 0
+
+    def _epoll_events(self, ep: Epoll, maxevents: int) -> list:
+        out = []
+        for fd, (events, data) in list(ep.watch.items()):
+            obj = self.fds.get(fd)
+            if obj is None:
+                continue
+            mask = 0
+            if events & EPOLLIN and self._readable(fd):
+                mask |= EPOLLIN
+            if events & EPOLLOUT and isinstance(obj, (Sock, Pipe, OpenFile)):
+                mask |= EPOLLOUT
+            if not mask:
+                ep.reported.discard(fd)
+                continue
+            if events & EPOLLET:                 # edge-triggered: report a state change once
+                if fd in ep.reported:
+                    continue
+                ep.reported.add(fd)
+            out.append((mask, data))
+            if len(out) >= maxevents:
+                break
+        return out
+
+    def sys_epoll_wait(self, epfd, events, maxevents, timeout, *_):
+        ep = self.fds.get(s32(epfd))
+        if not isinstance(ep, Epoll):
+            return -EBADF
+        maxevents = s32(maxevents)
+        if maxevents <= 0:
+            return -EINVAL
+        ready = self._epoll_events(ep, maxevents)
+        if ready:
+            layout = "<IQ" if self.arch.epoll_event_packed else "<IxxxxQ"
+            self.write(events, b"".join(struct.pack(layout, m, d) for m, d in ready))
+            return len(ready)
+        wait_ms = s32(timeout)
+        if wait_ms == 0:
+            return 0
+        if len(self.threads) == 1:               # nothing else could ever make it ready
+            if wait_ms > 0:
+                self.vtime += wait_ms / 1000
+            return 0
+        self.cur.restart_nr = self.uc.reg_read(self.arch.nr_reg)
+        return self._block("epoll", until=None if wait_ms < 0 else self.vtime + wait_ms / 1000)
+
+    sys_epoll_pwait = sys_epoll_wait
 
     def sys_inotify_add_watch(self, *_):
         return 1
@@ -561,6 +825,8 @@ class FakeKernel:
         return 0
 
     def sys_sched_yield(self, *_):
+        if len(self.threads) > 1:
+            self.yield_thread()
         return 0
 
     # ---------------------------------------------------------------- signals
@@ -597,8 +863,10 @@ class FakeKernel:
         return 0
 
     def sys_nanosleep(self, req, *_):
-        if req:
-            self.vtime += self._read_timespec(req)
+        delay = self._read_timespec(req) if req else 0.0
+        if len(self.threads) > 1:
+            return self._block("sleep", until=self.vtime + delay)   # others run while this one sleeps
+        self.vtime += delay
         return 0
 
     def sys_clock_nanosleep(self, clock, flags, req, *_):
@@ -840,6 +1108,11 @@ class FakeKernel:
                 data = self._pop_queue(obj, n)
             else:
                 return 0 if obj.type == SOCK_STREAM else -EAGAIN
+        elif isinstance(obj, EventFd):
+            if obj.counter == 0:
+                return -EAGAIN
+            data = struct.pack("<Q", obj.counter)
+            obj.counter = 0
         elif isinstance(obj, Pipe):
             data = bytes(obj.buf[:n])
             del obj.buf[:n]
@@ -894,7 +1167,14 @@ class FakeKernel:
             return self._send(obj, data, None)
         if isinstance(obj, Pipe):
             obj.buf += data
+            self._wake_epoll_waiters()
             return len(data)
+        if isinstance(obj, EventFd):
+            if len(data) < 8:
+                return -EINVAL
+            obj.counter += struct.unpack("<Q", data[:8])[0]
+            self._wake_epoll_waiters()
+            return 8
         return -EBADF
 
     def sys_writev(self, fd, iov, iovcnt, *_):
@@ -1256,6 +1536,8 @@ class FakeKernel:
             return bool(obj.recv_queue) or (obj.relay is not None and obj.relay.readable())
         if isinstance(obj, Pipe):
             return bool(obj.buf)
+        if isinstance(obj, EventFd):
+            return obj.counter > 0
         return isinstance(obj, OpenFile) or (isinstance(obj, Device) and obj.name == "urandom")
 
     def _relay_idle_wait(self, read_fds, timeout_s: float) -> None:

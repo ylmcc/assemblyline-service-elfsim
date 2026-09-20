@@ -3,7 +3,7 @@
 Docker Hub: [kylemc54321/assemblyline-service-elfsim](https://hub.docker.com/r/kylemc54321/assemblyline-service-elfsim)
 
 An [AssemblyLine 4](https://cybercentrecanada.github.io/assemblyline4_docs/) service that
-"detonates" 32-bit Linux ELF malware **by emulation, never by execution**. It targets the
+"detonates" Linux ELF malware (x86, x86-64 and MIPS) **by emulation, never by execution**. It targets the
 statically linked, stripped IoT bots (Mirai/Gafgyt-style loaders and their payloads) that
 static analysis struggles with: instead of guessing from strings, it runs the sample's
 instructions in [Unicorn](https://www.unicorn-engine.org/) and answers every system call from
@@ -33,8 +33,9 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |
 | Emulation stopped on a CPU fault | faulting pc, instruction bytes and the reason |
 
-The MIPS port was validated on a real static uClibc `busybox` (echo, uname, cat, ls, sleep), not only
-synthetic fixtures.
+The MIPS and x86-64 ports were validated on real static `busybox` builds (echo, uname, cat, ls, sleep,
+wget, nc) and, for x86-64 threads/epoll, on a real Go-built static binary, not only synthetic
+fixtures.
 
 A full event log is attached as the supplementary file `elfsim_report.json`.
 
@@ -50,6 +51,13 @@ first, and rewinding to the parent path when the child exits, execs or exhausts 
 budget, so both halves of `if (fork() == 0)` are explored and an idle daemon loop cannot
 starve the rest of the program. Unknown syscalls are answered `-ENOSYS` and reported.
 
+Threads (`clone` with `CLONE_THREAD`, as used by the Go runtime) are cooperative user-level threads
+with their own saved CPU state and TLS: the running thread keeps the CPU until it blocks in a
+`futex`, sleeps, waits in `epoll_wait` or yields, or its time slice runs out. Sleeps and timeouts
+use a virtual clock that jumps forward when every thread is blocked, so nothing waits in real
+time and results are deterministic. If every thread is blocked with nothing that could wake it,
+emulation stops with a `deadlock` reason instead of spinning.
+
 ## Submission parameters
 
 | Name | Default | Purpose |
@@ -61,18 +69,24 @@ starve the rest of the program. Unknown syscalls are answered `-ENOSYS` and repo
 
 ## Limitations
 
-- 32-bit little-endian **x86** and **MIPS (o32)** static binaries only. Other CPUs, 64-bit ELFs,
-  big-endian MIPS, N32/MIPS16/microMIPS and dynamically linked binaries are not emulated; the
-  result carries a collapsed, unscored note saying why (no heuristic, so no noise).
-- ARM, PowerPC and m68k are supported by Unicorn and would each need an `Arch` entry in
-  `elfsim_service/arch.py` (register map, syscall table, ABI constants); big-endian MIPS needs
-  byte-order support in the fake kernel. SH4 is not supported by Unicorn.
+- Static, non-PIE binaries only, for 32-bit x86, **x86-64** and little-endian **MIPS (o32)**. Other
+  CPUs, big-endian MIPS, N32/MIPS16/microMIPS, PIE (`ET_DYN`) and dynamically linked binaries are
+  not emulated; the result carries a collapsed, unscored note saying why (no heuristic, so no noise).
+- ARM/AArch64 and PowerPC are supported by Unicorn and would each need an `Arch` entry in
+  `elfsim_service/arch.py` (register map, syscall table, ABI constants). SH4 is not supported by
+  Unicorn.
 - Truncated files are loaded the way a kernel would (missing bytes read as zero) and the summary
   says so. A UPX-packed sample must be complete for any unpacker to work on it.
 - Memory is snapshotted at `fork()`, but the fake filesystem and network log are shared.
-- Threads (`clone` with `CLONE_VM`) are not emulated. On x86, TLS setup (`set_thread_area`) returns
-  `-ENOSYS` (MIPS handles it via the CP0 UserLocal register); a sample that needs either stops with
-  a fault and says so.
+- Threads run cooperatively, only on x86-64 (the only architecture with TLS-setting `clone`
+  wired up); on 32-bit x86 and MIPS a thread-creating `clone` is not emulated. On 32-bit x86, TLS
+  setup (`set_thread_area`) returns `-ENOSYS`.
+- Real address space is capped (128 MiB committed); `PROT_NONE` reservations are free, which is
+  what lets Go-style runtimes reserve huge ranges. A Go binary needed roughly 170 MiB of process
+  memory in testing.
+- `select`/`epoll_wait` with no timeout and nothing ready are treated as "nothing arrived": the
+  network is simulated, so a program waiting for a reply that never comes ends as a deadlock or
+  an instruction-budget stop.
 
 ## Development
 
@@ -84,8 +98,8 @@ python3 -m venv .venv
 .venv/bin/pytest test/
 ```
 
-The tests build tiny synthetic i386 and MIPS ELF files from a handful of opcodes
-(`test/unit/elfbuilder.py`, `test/unit/mipsbuilder.py`, `test/unit/demo_bot.py`). They are inert fixtures, contain no real
+The tests build tiny synthetic i386, x86-64 and MIPS ELF files from a handful of opcodes
+(`test/unit/elfbuilder.py`, `x64builder.py`, `mipsbuilder.py`, `demo_bot.py`). They are inert fixtures, contain no real
 malware and use only RFC 5737 documentation addresses and `.test` hostnames.
 
 ## Licence

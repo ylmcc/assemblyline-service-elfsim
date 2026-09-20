@@ -218,3 +218,11 @@ def test_mips_sample_is_emulated_end_to_end_through_the_service():
     titles = [s.title_text for s in req.result.sections]
     assert titles[0] == "Emulation summary" and any(t.startswith("Network connections") for t in titles)
     assert req.supp == ["elfsim_report.json"]
+
+
+def test_manifest_accepts_elf32_and_elf64_only():
+    accepts = yaml.safe_load(open(MANIFEST_PATH))["accepts"]
+    for ok in ("executable/linux/elf32", "executable/linux/elf64"):
+        assert re.fullmatch(accepts, ok)
+    for no in ("executable/windows/pe64", "executable/linux/elf", "code/shell", "executable/linux/elf128"):
+        assert not re.fullmatch(accepts, no)

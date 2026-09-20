@@ -36,6 +36,7 @@ _STOP_TEXT = {
     "syscall_limit": "syscall budget exhausted (typical of a bot looping on its C2 / event loop)",
     "instruction_limit": "instruction budget exhausted (typical of a bot idling in a main loop)",
     "timeout": "emulation time limit reached",
+    "deadlock": "every thread was blocked waiting on another (nothing left that could wake them)",
     "execve": "sample exec'd another program",
     "fault": "emulation stopped on a CPU fault (see the error section)",
 }
@@ -122,6 +123,8 @@ class ElfSim(ServiceBase):
         section.set_item("syscalls_emulated", report.syscalls_total)
         if abandoned:
             section.set_item("idle_forked_paths_abandoned", abandoned)
+        if report.threads_created:
+            section.set_item("threads_created", report.threads_created)
         if report.unknown_syscalls:
             section.set_item("unimplemented_syscalls", ", ".join(sorted(report.unknown_syscalls)))
         for i, note in enumerate(report.warnings, 1):

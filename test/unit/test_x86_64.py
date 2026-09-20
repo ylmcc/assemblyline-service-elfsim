@@ -178,3 +178,195 @@ def test_elf_class_must_match_the_architecture():
     q.exit(0)
     with pytest.raises(UnsupportedElf, match="expected 64-bit"):
         emulate(q.build(machine=62))                      # 32-bit ELF claiming x86-64
+
+
+# ---- threads (cooperative scheduler) ------------------------------------------------------
+THREAD_FLAGS = 0xD0F00        # CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS, as the Go runtime passes
+
+
+def _thread_stack(p: X64Prog) -> int:
+    area = p.d(b"\0" * 4096)
+    return area + 4096 - 64
+
+
+def test_thread_handoff_through_futex_with_per_thread_tls():
+    p = X64Prog()
+    tls_a, tls_b = p.d(struct.pack("<Q", 0xAAAA)), p.d(struct.pack("<Q", 0xBBBB))
+    flag, slot = p.d(struct.pack("<I", 0)), p.d(b"\0" * 8)
+    msg_c, msg_m = p.d(b"C"), p.d(b"M")
+    p.call("arch_prctl", 0x1002, tls_a)
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, tls_b)
+    p.jnz("parent")
+    p.call("write", 1, msg_c, 1)                       # ---- worker thread
+    p.load_fs0(); p.store_rax(slot); p.call("write", 1, slot, 8)
+    p.poke_byte(flag, 1)
+    p.call("futex", flag, 1, 1)                        # FUTEX_WAKE one waiter
+    p.call("exit", 0)                                  # thread exit, not exit_group
+    p.label("parent")                                  # ---- main thread
+    p.call("futex", flag, 0, 0, 0)                     # FUTEX_WAIT while *flag == 0
+    p.call("write", 1, msg_m, 1)
+    p.load_fs0(); p.store_rax(slot); p.call("write", 1, slot, 8)
+    p.call("exit_group", 0)
+    r = _run(p)
+    assert r.stdout == b"C" + struct.pack("<Q", 0xBBBB) + b"M" + struct.pack("<Q", 0xAAAA)
+    assert r.stop_reason == "exit(0)" and r.threads_created == 1
+
+
+def test_all_threads_blocked_is_reported_as_a_deadlock():
+    p = X64Prog()
+    flag = p.d(struct.pack("<I", 0))
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("parent")
+    p.call("exit", 0)                                  # worker leaves without waking anyone
+    p.label("parent")
+    p.call("futex", flag, 0, 0, 0)                     # main waits forever
+    p.exit(0)
+    assert _run(p).stop_reason == "deadlock"
+
+
+def test_sleeping_threads_wake_in_virtual_time_order():
+    p = X64Prog()
+    one, two = p.d(struct.pack("<QQ", 1, 0)), p.d(struct.pack("<QQ", 2, 0))
+    msg_w, msg_m = p.d(b"W"), p.d(b"M")
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("parent")
+    p.call("nanosleep", one)                           # worker sleeps 1 s
+    p.call("write", 1, msg_w, 1)
+    p.call("exit", 0)
+    p.label("parent")
+    p.call("nanosleep", two)                           # main sleeps 2 s
+    p.call("write", 1, msg_m, 1)
+    p.call("exit_group", 0)
+    r = _run(p)
+    assert r.stdout == b"WM" and r.elapsed < 5         # ordered by the virtual clock, no real waiting
+
+
+def test_a_spinning_thread_is_preempted_so_others_can_run():
+    p = X64Prog()
+    flag, msg = p.d(struct.pack("<I", 0)), p.d(b"D")
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("parent")
+    p.poke_byte(flag, 1)                               # worker just sets the flag
+    p.call("exit", 0)
+    p.label("parent")
+    p.spin_until_nonzero(flag)                         # main busy-waits without any syscall
+    p.call("write", 1, msg, 1)
+    p.call("exit_group", 0)
+    r = emulate(p.build(), max_instructions=20_000_000, timeout_s=20)
+    assert r.stdout == b"D" and r.stop_reason == "exit(0)"
+
+
+def test_futex_wait_with_a_timeout_on_a_single_thread_times_out():
+    p = X64Prog()
+    flag, ts, slot = p.d(struct.pack("<I", 0)), p.d(struct.pack("<QQ", 0, 1000)), p.d(b"\0" * 8)
+    p.call("futex", flag, 0, 0, ts)
+    p.store_rax(slot)
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    assert struct.unpack("<q", _run(p).stdout)[0] == -110       # ETIMEDOUT
+
+
+def test_futex_wait_returns_eagain_when_the_value_already_changed():
+    p = X64Prog()
+    flag, slot = p.d(struct.pack("<I", 5)), p.d(b"\0" * 8)
+    p.call("futex", flag, 0, 0, 0)                     # expects 0 but the word holds 5
+    p.store_rax(slot)
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    assert struct.unpack("<q", _run(p).stdout)[0] == -11        # EAGAIN
+
+
+def test_gettid_differs_per_thread():
+    p = X64Prog()
+    slot = p.d(b"\0" * 8)
+    flag = p.d(struct.pack("<I", 0))
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("parent")
+    p.call("gettid"); p.store_rax(slot); p.call("write", 1, slot, 8)
+    p.poke_byte(flag, 1); p.call("futex", flag, 1, 1); p.call("exit", 0)
+    p.label("parent")
+    p.call("futex", flag, 0, 0, 0)
+    p.call("gettid"); p.store_rax(slot); p.call("write", 1, slot, 8)
+    p.call("exit_group", 0)
+    child, main = struct.unpack("<QQ", _run(p).stdout)
+    assert child != main and {child, main} == {1000, 1001}
+
+
+def test_forked_parent_receives_the_child_pid_and_the_fork_syscall_runs_once():
+    p = X64Prog()
+    slot = p.d(b"\0" * 8)
+    p.call("fork")
+    p.jnz("parent")
+    p.exit(0)                                # child leaves at once
+    p.label("parent")
+    p.store_rax(slot)                        # what fork() returned to the parent
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    r = _run(p)
+    assert struct.unpack("<Q", r.stdout)[0] == 1001            # the child's pid, not -ENOSYS
+    assert r.unknown_syscalls == {} and r.syscall_counts["fork"] == 1
+
+
+# ---- epoll / eventfd ----------------------------------------------------------------------
+EPOLLIN, EPOLLET = 1, 1 << 31
+
+
+def _epoll_with_eventfd(p: X64Prog):
+    """epoll fd 3 watching eventfd 4 (edge-triggered, user data 0xDEADBEEF). fds are allocated
+    lowest-first, so the numbers are deterministic."""
+    event = p.d(struct.pack("<IQ", EPOLLIN | EPOLLET, 0xDEADBEEF))
+    p.call("epoll_create1", 0)
+    p.call("eventfd2", 0, 0)
+    p.call("epoll_ctl", 3, 1, 4, event)
+
+
+def test_epoll_reports_a_readable_eventfd_once_when_edge_triggered():
+    p = X64Prog()
+    one, out, slot = p.d(struct.pack("<Q", 1)), p.d(b"\0" * 64), p.d(b"\0" * 8)
+    _epoll_with_eventfd(p)
+    p.call("write", 4, one, 8)                         # make the eventfd readable
+    p.call("epoll_wait", 3, out, 8, 0)
+    p.store_rax(slot); p.call("write", 1, slot, 8); p.call("write", 1, out, 12)
+    p.call("epoll_wait", 3, out, 8, 0)                 # nothing new happened: edge already reported
+    p.store_rax(slot); p.call("write", 1, slot, 8)
+    p.exit(0)
+    stdout = _run(p).stdout
+    first_count, mask, data, second_count = (
+        struct.unpack("<Q", stdout[:8])[0], *struct.unpack("<IQ", stdout[8:20]),
+        struct.unpack("<Q", stdout[20:28])[0])
+    assert (first_count, mask, data, second_count) == (1, EPOLLIN, 0xDEADBEEF, 0)
+
+
+def test_thread_blocked_in_epoll_wait_is_woken_by_another_threads_eventfd_write():
+    p = X64Prog()
+    one, out, flag = p.d(struct.pack("<Q", 1)), p.d(b"\0" * 64), p.d(struct.pack("<I", 0))
+    msg_w, msg_m = p.d(b"W"), p.d(b"M")
+    _epoll_with_eventfd(p)
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("main")
+    p.call("epoll_wait", 3, out, 8, 0xFFFFFFFFFFFFFFFF)     # worker: timeout -1, blocks
+    p.call("write", 1, msg_w, 1)
+    p.poke_byte(flag, 1); p.call("futex", flag, 1, 1); p.call("exit", 0)
+    p.label("main")
+    p.call("sched_yield")                                   # let the worker start and block first
+    p.call("write", 4, one, 8)                              # wakes the worker's epoll_wait
+    p.call("futex", flag, 0, 0, 0)                          # wait for the worker to finish
+    p.call("write", 1, msg_m, 1)
+    p.call("exit_group", 0)
+    r = _run(p)
+    assert r.stdout == b"WM" and r.syscall_counts["epoll_wait"] == 2    # blocked, then re-run when woken
+    assert r.stop_reason == "exit(0)"
+
+
+def test_epoll_wait_with_nothing_to_wake_it_is_a_deadlock_not_a_spin():
+    p = X64Prog()
+    out = p.d(b"\0" * 64)
+    _epoll_with_eventfd(p)
+    p.call("clone", THREAD_FLAGS, _thread_stack(p), 0, 0, 0)
+    p.jnz("main")
+    p.call("epoll_wait", 3, out, 8, 0xFFFFFFFFFFFFFFFF)     # worker blocks forever
+    p.call("exit", 0)
+    p.label("main")
+    p.call("epoll_wait", 3, out, 8, 0xFFFFFFFFFFFFFFFF)     # so does main
+    p.exit(0)
+    assert _run(p).stop_reason == "deadlock"
