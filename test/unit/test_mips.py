@@ -126,15 +126,9 @@ def test_infinite_loop_hits_the_instruction_limit():
     assert r.stop_reason == "instruction_limit"
 
 
-def test_big_endian_and_n32_mips_are_reported_as_unsupported():
+def test_n32_and_micromips_are_reported_as_unsupported():
     p = MipsProg()
     p.exit(0)
-    be = bytearray(p.build())
-    be[5] = 2                                # EI_DATA = big-endian ...
-    fields = struct.unpack("<HHIIIIIHHHHHH", bytes(be[16:52]))
-    be[16:52] = struct.pack(">HHIIIIIHHHHHH", *fields)   # ... and a header that really is big-endian
-    with pytest.raises(UnsupportedElf, match="little-endian"):
-        emulate(bytes(be))
     with pytest.raises(UnsupportedElf, match="N32"):
         emulate(p.build(flags=0x1000 | 0x20))
     with pytest.raises(UnsupportedElf, match="microMIPS"):

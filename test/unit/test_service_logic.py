@@ -168,7 +168,7 @@ def test_a_session_cut_short_does_not_split_identical_conversations():
 def test_unsupported_file_gets_a_collapsed_explanation_with_no_heuristic():
     p = Prog()
     p.exit(0)
-    blob = p.build(machine=40)   # EM_ARM
+    blob = p.build(machine=20)   # EM_PPC
 
     class Req:
         file_contents = blob

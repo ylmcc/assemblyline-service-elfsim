@@ -86,13 +86,15 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     try:
         elf = ELFFile(io.BytesIO(data))
         machine = elf.header["e_machine"]
-        arch = ARCHES.get(machine)
+        arch = ARCHES.get((machine, elf.little_endian))
         if arch is None:
+            if any(a.e_machine == machine for a in ARCHES.values()):
+                raise UnsupportedElf(f"unsupported ELF variant for {machine}: "
+                                     f"{'little' if elf.little_endian else 'big'}-endian is not emulated")
             raise UnsupportedElf(f"unsupported machine {machine}")
-        if elf.elfclass != arch.elfclass or not elf.little_endian:
-            raise UnsupportedElf(f"unsupported ELF variant for {machine}: expected {arch.elfclass}-bit "
-                                 f"little-endian, got {elf.elfclass}-bit "
-                                 f"{'little' if elf.little_endian else 'big'}-endian")
+        if elf.elfclass != arch.elfclass:
+            raise UnsupportedElf(f"unsupported ELF variant for {machine}: expected {arch.elfclass}-bit, "
+                                 f"got {elf.elfclass}-bit")
         if machine == "EM_MIPS":
             flags = elf.header["e_flags"]
             if flags & 0x20:      # EF_MIPS_ABI2: the N32 ABI has a different syscall interface
@@ -114,6 +116,8 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         raise UnsupportedElf("no loadable segments")
 
     uc = Uc(arch.uc_arch, arch.uc_mode)
+    if arch.uc_cpu is not None:
+        uc.ctl_set_cpu_model(arch.uc_cpu)
 
     # ---- map segments (page runs not already mapped by an earlier segment)
     mapped_pages: set = set()
@@ -183,8 +187,11 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     words = [len(argv)] + argv_ptrs + [0] + env_ptrs + [0] + [w for kv in auxv for w in kv]
     word_fmt = "Q" if arch.word_size == 8 else "I"          # argc/argv/envp/auxv are machine words
     sp = (sp - arch.word_size * len(words)) & ~0xF
-    uc.mem_write(sp, struct.pack(f"<{len(words)}{word_fmt}", *words))
+    byte_order = "<" if arch.little_endian else ">"
+    uc.mem_write(sp, struct.pack(f"{byte_order}{len(words)}{word_fmt}", *words))
     uc.reg_write(arch.sp_reg, sp)
+    if arch.setup is not None:
+        arch.setup(uc)
     for reg, value in arch.entry_regs.items():   # e.g. MIPS: $t9 = entry, as PIC-aware startup code expects
         uc.reg_write(reg, entry if value == "entry" else value)
 
@@ -237,7 +244,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
             continue
         if kernel.replan:                         # a thread was just created: continue this one, now sliced
             kernel.replan = False
-            pc = uc.reg_read(arch.pc_reg)
+            pc = kernel.current_pc()
             continue
         if kernel.stop_reason:
             report.stop_reason = kernel.stop_reason
@@ -254,7 +261,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
             continue
         if kernel.has_pending_forks:
             kernel.abandon_path("instruction budget exhausted")
-            pc = uc.reg_read(arch.pc_reg)
+            pc = kernel.current_pc()
             continue
         report.stop_reason = "instruction_limit"
         break

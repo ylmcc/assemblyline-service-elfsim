@@ -9,10 +9,15 @@ for the syscall instruction, and the syscall-number -> name table.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
-from unicorn import UC_ARCH_MIPS, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_MODE_LITTLE_ENDIAN, UC_MODE_MIPS32
+from unicorn import UC_ARCH_ARM, UC_MODE_ARM, UC_PROT_ALL, UC_ARCH_MIPS, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_MODE_BIG_ENDIAN, UC_MODE_LITTLE_ENDIAN, UC_MODE_MIPS32
+from unicorn.arm_const import (
+    UC_ARM_REG_C1_C0_2, UC_ARM_REG_C13_C0_3, UC_ARM_REG_CPSR, UC_ARM_REG_FPEXC, UC_ARM_REG_PC,
+    UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4, UC_ARM_REG_R5,
+    UC_ARM_REG_R7, UC_ARM_REG_SP, UC_CPU_ARM_CORTEX_A15,
+)
 from unicorn.mips_const import (
     UC_MIPS_REG_A0, UC_MIPS_REG_A1, UC_MIPS_REG_A2, UC_MIPS_REG_A3, UC_MIPS_REG_CP0_USERLOCAL,
     UC_MIPS_REG_PC, UC_MIPS_REG_SP, UC_MIPS_REG_T9, UC_MIPS_REG_V0, UC_MIPS_REG_V1,
@@ -40,6 +45,7 @@ class Arch:
     syscalls: dict            # number -> name
     word_size: int = 4
     elfclass: int = 32                        # ELFCLASS the loader must see (32 or 64)
+    little_endian: bool = True                # byte order of the guest (MIPS also comes big-endian)
     syscall_hook: str = "intr"                # "intr": UC_HOOK_INTR (int 0x80 / MIPS syscall); "insn_syscall": UC_HOOK_INSN on x86-64 `syscall`
     syscall_insn_len: int = 0                 # x86-64: inside the syscall hook RIP is still AT the 2-byte instruction
     select_takes_struct: bool = True          # old i386 select(2) takes ONE pointer to its 5 arguments
@@ -62,6 +68,9 @@ class Arch:
     set_tls: Optional[Callable] = None       # set_thread_area(): install the TLS pointer
     entry_regs: dict = field(default_factory=dict)       # extra registers at entry ("entry" = pc)
     uname_machine: str = "i686"              # what uname(2) reports, which bots sometimes report onward
+    uc_cpu: Optional[int] = None             # CPU model to select (ARM needs a v7 core for Thumb-2/VFP code)
+    cpsr_reg: Optional[int] = None           # ARM: register holding the Thumb (T) bit, needed to resume
+    setup: Optional[Callable] = None         # one-time machine setup after mapping (ARM: VFP, kuser helpers)
     stack_top: int = 0xC0000000              # top of the user stack
     user_limit: int = 0xBF000000             # highest usable user address (MIPS32: 0x7fffffff)
 
@@ -187,4 +196,46 @@ X86_64 = Arch(
     user_limit=0x7F0000000000,
 )
 
-ARCHES = {a.e_machine: a for a in (I386, MIPSEL, X86_64)}
+# ---- ARM (EABI, little-endian). Syscalls via `svc #0` with the number in r7 and arguments in
+# r0-r5; errors come back as -errno in r0 (like i386). TLS is a private syscall (set_tls) or the
+# TPIDRURO register read with `mrc p15`; older static binaries also call the kernel's "kuser"
+# helpers on the vector page (0xffff0fxx) for atomics and the thread pointer, so we provide them.
+_ARM_KUSER_PAGE = 0xFFFF0000
+
+
+def _arm_setup(uc) -> None:
+    uc.mem_map(_ARM_KUSER_PAGE, 0x1000, UC_PROT_ALL)
+    bx_lr = (0xE12FFF1E).to_bytes(4, "little")
+    words = lambda *ws: b"".join(w.to_bytes(4, "little") for w in ws)   # noqa: E731
+    uc.mem_write(_ARM_KUSER_PAGE + 0xFA0, bx_lr)                                    # __kuser_memory_barrier
+    uc.mem_write(_ARM_KUSER_PAGE + 0xFC0, words(0xE5923000, 0xE0533000, 0x05821000,  # __kuser_cmpxchg
+                                                0xE2730000, 0xE12FFF1E))            # ldr/subs/streq/rsbs/bx
+    uc.mem_write(_ARM_KUSER_PAGE + 0xFE0, words(0xEE1D0F70, 0xE12FFF1E))            # __kuser_get_tls: mrc; bx lr
+    uc.mem_write(_ARM_KUSER_PAGE + 0xFFC, words(5))                                 # __kuser_helper_version
+    uc.reg_write(UC_ARM_REG_C1_C0_2, uc.reg_read(UC_ARM_REG_C1_C0_2) | (0xF << 20))  # allow VFP/NEON
+    uc.reg_write(UC_ARM_REG_FPEXC, 0x40000000)                                       # ...and enable it
+
+
+ARM = Arch(
+    name="arm",
+    e_machine="EM_ARM",
+    uc_arch=UC_ARCH_ARM,
+    uc_mode=UC_MODE_ARM,
+    pc_reg=UC_ARM_REG_PC,
+    sp_reg=UC_ARM_REG_SP,
+    nr_reg=UC_ARM_REG_R7,
+    arg_regs=(UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4, UC_ARM_REG_R5),
+    ret_reg=UC_ARM_REG_R0,
+    intr_no=2,
+    syscalls=_load_syscall_table("syscalls_arm.txt"),
+    uc_cpu=UC_CPU_ARM_CORTEX_A15,
+    cpsr_reg=UC_ARM_REG_CPSR,
+    setup=_arm_setup,
+    set_tls=lambda uc, addr: uc.reg_write(UC_ARM_REG_C13_C0_3, addr),
+    uname_machine="armv7l",
+)
+
+# Big-endian MIPS (the "mips" builds of router malware): identical ABI, other byte order.
+MIPSBE = replace(MIPSEL, name="mips", uc_mode=UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN, little_endian=False)
+
+ARCHES = {(a.e_machine, a.little_endian): a for a in (I386, MIPSEL, MIPSBE, X86_64, ARM)}

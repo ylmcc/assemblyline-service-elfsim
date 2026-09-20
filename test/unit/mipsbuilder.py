@@ -22,7 +22,7 @@ class MipsProg(Prog):
         self.branches: list = []   # (byte offset of the branch in .code, label)
 
     def _w(self, word: int) -> None:
-        self.code += struct.pack("<I", word & 0xFFFFFFFF)
+        self.code += struct.pack(self.endian + "I", word & 0xFFFFFFFF)
 
     def li(self, reg: int, imm: int) -> None:
         imm &= 0xFFFFFFFF
@@ -88,6 +88,11 @@ class MipsProg(Prog):
         for pos, label in self.branches:
             after = self.base + CODE_OFF + pos + 4
             offset = ((self.labels[label] - after) >> 2) & 0xFFFF
-            word = struct.unpack_from("<I", self.code, pos)[0] & 0xFFFF0000
-            struct.pack_into("<I", self.code, pos, word | offset)
+            word = struct.unpack_from(self.endian + "I", self.code, pos)[0] & 0xFFFF0000
+            struct.pack_into(self.endian + "I", self.code, pos, word | offset)
         return super().build(machine=machine, flags=flags)
+
+
+class MipsBEProg(MipsProg):
+    """Big-endian MIPS: the same instructions and data, the other byte order."""
+    endian = ">"

@@ -7,8 +7,9 @@ description: >
   filesystem or process behind it, and by default no network either. Reports what the sample tried to do -- C2
   connections and registration data, DNS lookups, files dropped, fork/exec, process
   renaming -- which static analysis cannot recover from stripped, statically linked bots.
-  Emulates static, non-PIE x86 (32- and 64-bit) and little-endian MIPS (o32) binaries. Other CPU
-  types, big-endian, PIE and dynamically linked files are not emulated; a collapsed note says why.
+  Emulates static, non-PIE x86 (32- and 64-bit), MIPS (o32, both byte orders) and ARM (EABI)
+  binaries. Other CPU types, big-endian ARM, PIE and dynamically linked files are not emulated;
+  a collapsed note says why.
 
 accepts: executable/linux/elf(32|64)
 rejects: empty|metadata/.*

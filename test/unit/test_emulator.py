@@ -151,7 +151,7 @@ def test_other_architectures_are_unsupported_for_now():
     p = Prog()
     p.exit(0)
     with pytest.raises(UnsupportedElf, match="unsupported machine"):
-        emulate(p.build(machine=40))   # EM_ARM
+        emulate(p.build(machine=20))   # EM_PPC
 
 
 def test_fork_child_memory_writes_do_not_leak_into_the_parent_path():
@@ -225,3 +225,21 @@ def test_a_heartbeat_loop_cannot_push_out_the_first_messages():
     p.exit(0)
     (conv,) = _run(p).sent
     assert conv["messages"] == [[b"\x04px86", 1], [b"\x00\x00", 300]]
+
+
+def test_recvfrom_reports_the_sender_so_resolvers_accept_the_answer():
+    """musl's resolver drops replies whose source address isn't the server it queried."""
+    query = (struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+             + b"\x02c2\x04test\x00" + struct.pack(">HH", 1, 1))
+    p = Prog()
+    dest = p.d(Prog.sockaddr_in("203.0.113.53", 53))
+    q, buf, src, srclen = p.d(query), p.d(b"\0" * 128), p.d(b"\0" * 16), p.d(struct.pack("<I", 16))
+    p.sys(359, 2, 2, 0)
+    p.ebx_from_eax()
+    p.mov(1, q); p.mov(2, len(query)); p.mov(6, 0); p.mov(7, dest); p.mov(5, 16); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                                  # sendto
+    p.mov(1, buf); p.mov(2, 128); p.mov(6, 0); p.mov(7, src); p.mov(5, srclen); p.mov(0, 371)
+    p.raw(b"\xcd\x80")                                  # recvfrom(fd, buf, 128, 0, &src, &len)
+    p.sys(4, 1, src, 8)
+    p.exit(0)
+    assert _run(p).stdout == struct.pack("<H", 2) + struct.pack(">H", 53) + bytes([203, 0, 113, 53])
