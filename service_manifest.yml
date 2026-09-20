@@ -19,7 +19,7 @@ file_required: true
 timeout: 120
 disable_cache: false
 enabled: true
-is_external: false
+is_external: true
 licence_count: 0
 
 submission_params:
