@@ -57,6 +57,7 @@ class EmulationReport:
     open_counts: dict = field(default_factory=dict)  # most-opened paths (diagnostics)
     elapsed: float = 0.0
     threads_created: int = 0
+    child_crashes: list = field(default_factory=list)  # forked paths that died on a CPU fault
     warnings: list = field(default_factory=list)  # oddities in the file itself (e.g. truncated segments)
 
 
@@ -238,7 +239,16 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
         try:
             uc.emu_start(pc, 0, timeout=remaining_us, count=count)
         except UcError as e:
-            report.error = _describe_fault(uc, arch, e)
+            err = _describe_fault(uc, arch, e)
+            if kernel.has_pending_forks:
+                # A crash in a forked child only kills that process, as on a real OS: note it and
+                # carry on with the parent so the other paths (helpers, siblings) are still seen.
+                kernel.log("process", "fork", note=f"forked path crashed: {err['type']} at pc={err.get('pc')}; "
+                                                   "continuing with the parent")
+                report.child_crashes.append(err)
+                kernel.resume = kernel._forks.pop()
+                continue
+            report.error = err
             report.stop_reason = "fault"
             break
         if kernel.resume is not None or kernel.switch_to is not None:

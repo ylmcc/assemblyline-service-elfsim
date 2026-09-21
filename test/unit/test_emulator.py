@@ -253,3 +253,25 @@ def test_readlink_of_proc_self_exe_returns_the_programs_own_path():
     p.sys(4, 1, buf)                             # write(1, buf, edx)
     p.exit(0)
     assert emulate(p.build(), argv=["/tmp/robben"], timeout_s=10).stdout == b"/tmp/robben"
+
+
+def test_a_crash_in_a_forked_child_only_kills_that_path():
+    p = Prog()
+    p.sys(2)                                             # fork
+    p.jnz("parent")
+    p.raw(b"\xa1" + struct.pack("<I", 0xDEADBEEF))       # child: mov eax, [0xdeadbeef] -> fault
+    p.label("parent")
+    msg = p.d(b"P")
+    p.sys(4, 1, msg, 1)
+    p.exit(0)
+    r = _run(p)
+    assert r.stdout == b"P" and r.stop_reason == "exit(0)" and r.error is None
+    assert len(r.child_crashes) == 1 and "unmapped" in r.child_crashes[0]["type"]
+    assert any("forked path crashed" in e.get("note", "") for e in r.events)
+
+
+def test_a_crash_on_the_main_path_is_still_reported_as_a_fault():
+    p = Prog()
+    p.raw(b"\xa1" + struct.pack("<I", 0xDEADBEEF))
+    r = _run(p)
+    assert r.stop_reason == "fault" and r.child_crashes == []

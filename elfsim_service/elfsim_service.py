@@ -159,6 +159,10 @@ class ElfSim(ServiceBase):
             section.set_item("internet_access", "enabled: real connections to public addresses")
         if abandoned:
             section.set_item("idle_forked_paths_abandoned", abandoned)
+        if report.child_crashes:
+            first = report.child_crashes[0]
+            section.set_item("forked_paths_crashed", f"{len(report.child_crashes)} (first: {first['type']} at "
+                                                     f"pc={first.get('pc')}); the parent and other paths continued")
         if report.threads_created:
             section.set_item("threads_created", report.threads_created)
         if report.unknown_syscalls:
