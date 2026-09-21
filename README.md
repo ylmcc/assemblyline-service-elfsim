@@ -3,7 +3,7 @@
 Docker Hub: [kylemc54321/assemblyline-service-elfsim](https://hub.docker.com/r/kylemc54321/assemblyline-service-elfsim)
 
 An [AssemblyLine 4](https://cybercentrecanada.github.io/assemblyline4_docs/) service that
-"detonates" Linux ELF malware (x86, x86-64 and MIPS) **by emulation, never by execution**. It targets the
+"detonates" Linux ELF malware (x86, x86-64, MIPS and ARM) **by emulation, never by execution**. It targets the
 statically linked, stripped IoT bots (Mirai/Gafgyt-style loaders and their payloads) that
 static analysis struggles with: instead of guessing from strings, it runs the sample's
 instructions in [Unicorn](https://www.unicorn-engine.org/) and answers every system call from
@@ -34,10 +34,11 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | DNS lookups | domain parsed from the query and answered with a documentation-range sinkhole so the sample carries on to its real C2 connect; tags `network.dynamic.domain` |
 | What the sample sent | a readable transcript per distinct conversation: control bytes as `\xNN`, adjacent TCP sends joined, repeats as `xN`, plus the printable text found (hex only in the supplementary JSON) |
 | Process activity | `fork`/`setsid` daemonising, `prctl` renames, `execve` (with argv), `kill`, `ptrace` probes |
+| Extracted scripts | every `sh -c <command>` the sample tried to run is extracted as a script (relation DYNAMIC), so AL sends it to BashSim / PayloadFetcher. A template command (a literal `%s`) has no URL until a live C2 fills it in |
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |
 | Emulation stopped on a CPU fault | faulting pc, instruction bytes and the reason |
 
-The MIPS and x86-64 ports were validated on real static `busybox` builds (echo, uname, cat, ls, sleep,
+The MIPS (both byte orders), ARM and x86-64 ports were validated on real static `busybox` builds (echo, uname, cat, ls, sleep,
 wget, nc) and, for x86-64 threads/epoll, on a real Go-built static binary, not only synthetic
 fixtures.
 
@@ -74,10 +75,10 @@ emulation stops with a `deadlock` reason instead of spinning.
 
 ## Limitations
 
-- Static, non-PIE binaries only, for 32-bit x86, **x86-64** and little-endian **MIPS (o32)**. Other
-  CPUs, big-endian MIPS, N32/MIPS16/microMIPS, PIE (`ET_DYN`) and dynamically linked binaries are
-  not emulated; the result carries a collapsed, unscored note saying why (no heuristic, so no noise).
-- ARM/AArch64 and PowerPC are supported by Unicorn and would each need an `Arch` entry in
+- Static, non-PIE binaries only, for 32-bit x86, **x86-64**, **MIPS (o32, little- and big-endian)** and
+  **ARM (EABI, little-endian; ARM and Thumb)**. Other CPUs, big-endian ARM, N32/MIPS16/microMIPS, PIE
+  (`ET_DYN`) and dynamically linked binaries are not emulated; the result carries a collapsed, unscored note saying why (no heuristic, so no noise).
+- AArch64 and PowerPC are supported by Unicorn and would each need an `Arch` entry in
   `elfsim_service/arch.py` (register map, syscall table, ABI constants). SH4 is not supported by
   Unicorn.
 - Truncated files are loaded the way a kernel would (missing bytes read as zero) and the summary
@@ -103,8 +104,8 @@ python3 -m venv .venv
 .venv/bin/pytest test/
 ```
 
-The tests build tiny synthetic i386, x86-64 and MIPS ELF files from a handful of opcodes
-(`test/unit/elfbuilder.py`, `x64builder.py`, `mipsbuilder.py`, `demo_bot.py`). They are inert fixtures, contain no real
+The tests build tiny synthetic i386, x86-64, MIPS and ARM ELF files from a handful of opcodes
+(`test/unit/elfbuilder.py`, `x64builder.py`, `mipsbuilder.py`, `armbuilder.py`, `demo_bot.py`). They are inert fixtures, contain no real
 malware and use only RFC 5737 documentation addresses and `.test` hostnames.
 
 ## Licence

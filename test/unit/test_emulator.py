@@ -151,7 +151,7 @@ def test_other_architectures_are_unsupported_for_now():
     p = Prog()
     p.exit(0)
     with pytest.raises(UnsupportedElf, match="unsupported machine"):
-        emulate(p.build(machine=40))   # EM_ARM
+        emulate(p.build(machine=20))   # EM_PPC
 
 
 def test_fork_child_memory_writes_do_not_leak_into_the_parent_path():
@@ -225,3 +225,65 @@ def test_a_heartbeat_loop_cannot_push_out_the_first_messages():
     p.exit(0)
     (conv,) = _run(p).sent
     assert conv["messages"] == [[b"\x04px86", 1], [b"\x00\x00", 300]]
+
+
+def test_recvfrom_reports_the_sender_so_resolvers_accept_the_answer():
+    """musl's resolver drops replies whose source address isn't the server it queried."""
+    query = (struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+             + b"\x02c2\x04test\x00" + struct.pack(">HH", 1, 1))
+    p = Prog()
+    dest = p.d(Prog.sockaddr_in("203.0.113.53", 53))
+    q, buf, src, srclen = p.d(query), p.d(b"\0" * 128), p.d(b"\0" * 16), p.d(struct.pack("<I", 16))
+    p.sys(359, 2, 2, 0)
+    p.ebx_from_eax()
+    p.mov(1, q); p.mov(2, len(query)); p.mov(6, 0); p.mov(7, dest); p.mov(5, 16); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                                  # sendto
+    p.mov(1, buf); p.mov(2, 128); p.mov(6, 0); p.mov(7, src); p.mov(5, srclen); p.mov(0, 371)
+    p.raw(b"\xcd\x80")                                  # recvfrom(fd, buf, 128, 0, &src, &len)
+    p.sys(4, 1, src, 8)
+    p.exit(0)
+    assert _run(p).stdout == struct.pack("<H", 2) + struct.pack(">H", 53) + bytes([203, 0, 113, 53])
+
+
+def test_readlink_of_proc_self_exe_returns_the_programs_own_path():
+    p = Prog()
+    link, buf = p.cstr("/proc/self/exe"), p.d(b"\0" * 64)
+    p.sys(85, link, buf, 63)                     # readlink(path, buf, size) -> length in eax
+    p.edx_from_eax()
+    p.sys(4, 1, buf)                             # write(1, buf, edx)
+    p.exit(0)
+    assert emulate(p.build(), argv=["/tmp/robben"], timeout_s=10).stdout == b"/tmp/robben"
+
+
+def test_a_crash_in_a_forked_child_only_kills_that_path():
+    p = Prog()
+    p.sys(2)                                             # fork
+    p.jnz("parent")
+    p.raw(b"\xa1" + struct.pack("<I", 0xDEADBEEF))       # child: mov eax, [0xdeadbeef] -> fault
+    p.label("parent")
+    msg = p.d(b"P")
+    p.sys(4, 1, msg, 1)
+    p.exit(0)
+    r = _run(p)
+    assert r.stdout == b"P" and r.stop_reason == "exit(0)" and r.error is None
+    assert len(r.child_crashes) == 1 and "unmapped" in r.child_crashes[0]["type"]
+    assert any("forked path crashed" in e.get("note", "") for e in r.events)
+
+
+def test_a_crash_on_the_main_path_is_still_reported_as_a_fault():
+    p = Prog()
+    p.raw(b"\xa1" + struct.pack("<I", 0xDEADBEEF))
+    r = _run(p)
+    assert r.stop_reason == "fault" and r.child_crashes == []
+
+
+def test_raw_socket_sends_are_labelled_raw_not_tcp():
+    p = Prog()
+    dest, pkt = p.d(Prog.sockaddr_in("198.51.100.9", 23)), p.d(b"E\x00\x00\x28" + b"\0" * 36)
+    p.sys(359, 2, 3, 255)                       # socket(AF_INET, SOCK_RAW, IPPROTO_RAW)
+    p.ebx_from_eax()
+    p.mov(1, pkt); p.mov(2, 40); p.mov(6, 0); p.mov(7, dest); p.mov(5, 16); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                          # sendto
+    p.exit(0)
+    (conv,) = _run(p).sent
+    assert conv["proto"] == "raw" and conv["ip"] == "198.51.100.9"

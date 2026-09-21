@@ -7,8 +7,9 @@ description: >
   filesystem or process behind it, and by default no network either. Reports what the sample tried to do -- C2
   connections and registration data, DNS lookups, files dropped, fork/exec, process
   renaming -- which static analysis cannot recover from stripped, statically linked bots.
-  Emulates static, non-PIE x86 (32- and 64-bit) and little-endian MIPS (o32) binaries. Other CPU
-  types, big-endian, PIE and dynamically linked files are not emulated; a collapsed note says why.
+  Emulates static, non-PIE x86 (32- and 64-bit), MIPS (o32, both byte orders) and ARM (EABI)
+  binaries. Other CPU types, big-endian ARM, PIE and dynamically linked files are not emulated;
+  a collapsed note says why.
 
 accepts: executable/linux/elf(32|64)
 rejects: empty|metadata/.*
@@ -113,6 +114,17 @@ heuristics:
       data_received: 0
       payload_received: 300
     attack_id: T1105
+
+  - heur_id: 9
+    name: Raw packets built by the sample
+    description: The sample sent hand-built IP packets through a raw socket; to many distinct hosts this is scanning (e.g. a Telnet SYN scanner).
+    filetype: ".*"
+    score: 0
+    max_score: 300
+    signature_score_map:
+      syn_scan: 300
+      raw_packets: 0
+    attack_id: T1595
 
 docker_config:
   image: kylemc54321/assemblyline-service-elfsim:$SERVICE_TAG
