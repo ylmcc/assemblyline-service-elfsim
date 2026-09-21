@@ -318,10 +318,10 @@ def test_a_few_raw_packets_are_shown_but_not_scored_as_scanning():
 
 
 def test_raw_conversations_are_kept_out_of_the_sent_data_listing():
-    sections = _sections(ElfSim._sent_data, _report(sent=[_raw_conv("198.51.100.7"), _conv([[b"hello", 1]])]))
+    sections = _sections(ElfSim._sent_data, _report(sent=[_raw_conv("198.51.100.77"), _conv([[b"hello", 1]])]))
     sent = next(s for s in sections if s.title_text.startswith("What the sample sent"))
     scan = next(s for s in sections if s.title_text.startswith("Raw packets"))
-    assert "198.51.100.7" not in sent.body and "hello" in sent.body and "198.51.100.7" in scan.body
+    assert "198.51.100.77" not in sent.body and "hello" in sent.body and "198.51.100.77" in scan.body
 
 
 def test_dns_queries_are_rendered_as_text():
