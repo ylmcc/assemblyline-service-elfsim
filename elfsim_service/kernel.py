@@ -1493,7 +1493,8 @@ class FakeKernel:
 
     def _send(self, sock: Sock, data: bytes, dest: Optional[dict]) -> int:
         remote = dest or sock.remote or {}
-        proto = "netlink" if sock.family == AF_NETLINK else "udp" if sock.type == SOCK_DGRAM else "tcp"
+        proto = ("netlink" if sock.family == AF_NETLINK else "raw" if sock.type == SOCK_RAW
+                 else "udp" if sock.type == SOCK_DGRAM else "tcp")
         if dest and "ip" in dest:
             self.network.append({"op": "sendto", "proto": proto, **dest})
             self.log("network", "sendto", proto=proto, **dest, bytes=len(data))

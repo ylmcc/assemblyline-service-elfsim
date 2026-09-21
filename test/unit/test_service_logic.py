@@ -1,3 +1,4 @@
+import struct
 import os
 import re
 from types import SimpleNamespace
@@ -282,3 +283,50 @@ def test_a_telnet_login_brute_force_is_summarised_not_listed():
 def test_binary_protocols_still_get_readable_text_without_duplicates():
     (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[b"\x00\x00\x00\x01\x04px86\x03x86\x04px86", 1]])]))
     assert section.body.count('"px86"') == 1
+
+
+# ---- raw packets and DNS are decoded, not dumped ------------------------------------------
+def _syn(dst: str, sport: int = 1668, dport: int = 23) -> bytes:
+    """A hand-built IPv4/TCP SYN like a Mirai scanner sends: sequence number == destination."""
+    d = bytes(int(o) for o in dst.split("."))
+    ip = bytes([0x45, 0, 0, 40]) + b"\x9c\x9d\0\0" + bytes([64, 6]) + b"\0\0" + b"\0\0\0\0" + d
+    tcp = struct.pack(">HH", sport, dport) + d + b"\0\0\0\0" + bytes([0x50, 0x02]) + struct.pack(">H", 0xA7D0) + b"\0\0\0\0"
+    return ip + tcp
+
+
+def _raw_conv(dst: str):
+    return _conv([[_syn(dst), 1]], ip=dst, port=23, proto="raw")
+
+
+def test_a_syn_scan_is_summarised_with_the_mirai_fingerprint_and_scores():
+    convs = [_raw_conv(f"198.51.100.{i}") for i in range(1, 26)]
+    result = Result()
+    ElfSim()._scanning(result, convs)
+    (section,) = result.sections
+    assert "TCP SYN to port 23 (Telnet): 25 packets to 25 distinct hosts" in section.body
+    assert "198.51.100.1, 198.51.100.2" in section.body and "(+17 more)" in section.body
+    assert "ttl 64, 40 bytes each, window 0xa7d0, source port 1668" in section.body
+    assert "Mirai scanner fingerprint" in section.body
+    assert "\\x" not in section.body and section.heuristic.score == 300
+
+
+def test_a_few_raw_packets_are_shown_but_not_scored_as_scanning():
+    result = Result()
+    ElfSim()._scanning(result, [_raw_conv(f"198.51.100.{i}") for i in range(1, 4)])
+    (section,) = result.sections
+    assert section.heuristic.score == 0 and "3 packets to 3 distinct hosts" in section.body
+
+
+def test_raw_conversations_are_kept_out_of_the_sent_data_listing():
+    sections = _sections(ElfSim._sent_data, _report(sent=[_raw_conv("198.51.100.7"), _conv([[b"hello", 1]])]))
+    sent = next(s for s in sections if s.title_text.startswith("What the sample sent"))
+    scan = next(s for s in sections if s.title_text.startswith("Raw packets"))
+    assert "198.51.100.7" not in sent.body and "hello" in sent.body and "198.51.100.7" in scan.body
+
+
+def test_dns_queries_are_rendered_as_text():
+    query = (struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+             + b"\x02c2\x04test\x00" + struct.pack(">HH", 1, 1))
+    conv = _conv([[query, 2]], ip="203.0.113.53", port=53, proto="udp")
+    (section,) = _sections(ElfSim._sent_data, _report(sent=[conv]))
+    assert "DNS query for c2.test (A)    x2" in section.body and "\\x" not in section.body

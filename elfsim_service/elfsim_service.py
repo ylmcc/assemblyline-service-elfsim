@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import shlex
+import struct
 from collections import Counter
 
 from assemblyline_v4_service.common.base import ServiceBase
@@ -22,12 +23,19 @@ from assemblyline_v4_service.common.result import (
 from assemblyline_v4_service.common.task import PARENT_RELATION
 
 from elfsim_service.emulator import UnsupportedElf, emulate
+from elfsim_service.kernel import _parse_dns_query
 from elfsim_service.network import LiveNetwork
 from elfsim_service.textview import line_summary, printable_ratio, readable, strip_ansi, text_runs
 
 MAX_ROWS = 30
 MAX_CONVERSATIONS = 8
 MAX_TRANSCRIPT_LINES = 25
+SCAN_MIN_HOSTS = 10             # raw packets to this many distinct hosts count as scanning
+_SERVICES = {21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP", 443: "HTTPS",
+             445: "SMB", 2323: "Telnet (alt)", 5555: "Android Debug Bridge", 7547: "TR-069",
+             8080: "HTTP (alt)", 37215: "Huawei router", 52869: "UPnP router"}
+_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"}
+_TCP_FLAGS = ((0x02, "SYN"), (0x10, "ACK"), (0x01, "FIN"), (0x04, "RST"), (0x08, "PSH"), (0x20, "URG"))
 LINE_SUMMARY_MIN = 6            # a text conversation with this many lines is summarised, not listed
 MAX_EXTRACTED = 10
 SHELLS = ("sh", "bash", "dash", "ash", "busybox")
@@ -79,9 +87,82 @@ def _transcript(proto: str, messages: tuple, reps: list) -> list:
     return lines[:MAX_TRANSCRIPT_LINES]
 
 
-def _body_lines(proto: str, messages: tuple, reps: list) -> list:
+def _parse_ipv4(pkt: bytes):
+    """Decode a hand-built IPv4 packet: dict of what a human wants to know, or None."""
+    if len(pkt) < 20 or pkt[0] >> 4 != 4:
+        return None
+    ihl = (pkt[0] & 15) * 4
+    if ihl < 20 or len(pkt) < ihl:
+        return None
+    info = {"ttl": pkt[8], "proto": pkt[9], "src": ".".join(map(str, pkt[12:16])),
+            "dst": ".".join(map(str, pkt[16:20])), "size": len(pkt), "sport": None, "dport": None,
+            "flags": "", "seq_is_dst": False, "window": None}
+    body = pkt[ihl:]
+    if pkt[9] in (6, 17) and len(body) >= 4:
+        info["sport"], info["dport"] = struct.unpack(">HH", body[:4])
+    if pkt[9] == 6 and len(body) >= 20:
+        info["flags"] = "+".join(n for bit, n in _TCP_FLAGS if body[13] & bit) or "no flags"
+        info["window"] = struct.unpack(">H", body[14:16])[0]
+        info["seq_is_dst"] = body[4:8] == pkt[16:20]       # Mirai's scanner sets seq = destination
+    return info
+
+
+def _scanning_lines(packets: list) -> tuple:
+    """Summarise raw packets the sample built itself: (lines, distinct hosts)."""
+    groups: dict = {}
+    for pkt, count in packets:
+        info = _parse_ipv4(pkt)
+        if not info:
+            continue
+        name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(info["proto"], f"IP protocol {info['proto']}")
+        label = f"{name} {info['flags']}".strip() if info["flags"] else name
+        g = groups.setdefault((label, info["dport"]), {"n": 0, "hosts": {}, "ttl": set(), "win": set(),
+                                                        "size": set(), "sport": set(), "seq": 0})
+        g["n"] += count
+        g["hosts"].setdefault(info["dst"], 0)
+        g["ttl"].add(info["ttl"]); g["size"].add(info["size"]); g["sport"].add(info["sport"])
+        if info["window"] is not None:
+            g["win"].add(info["window"])
+        g["seq"] += count if info["seq_is_dst"] else 0
+    lines, hosts_total = [], set()
+    for (label, dport), g in sorted(groups.items(), key=lambda kv: -kv[1]["n"]):
+        hosts = list(g["hosts"])
+        hosts_total.update(hosts)
+        port = f" port {dport} ({_SERVICES[dport]})" if dport in _SERVICES else (f" port {dport}" if dport else "")
+        lines.append(f"{label} to{port}: {g['n']} packets to {len(hosts)} distinct hosts")
+        more = f" (+{len(hosts) - 8} more)" if len(hosts) > 8 else ""
+        lines.append("    e.g. " + ", ".join(hosts[:8]) + more)
+        facts = [f"ttl {'/'.join(map(str, sorted(g['ttl'])))}", f"{'/'.join(map(str, sorted(g['size'])))} bytes each"]
+        if g["win"]:
+            facts.append("window " + "/".join(hex(w) for w in sorted(g["win"])))
+        sports = {p for p in g["sport"] if p}
+        if sports:
+            facts.append(f"source port {next(iter(sports))}" if len(sports) == 1 else "source port varies")
+        lines.append("    " + ", ".join(facts))
+        if g["seq"] >= 0.9 * g["n"]:
+            lines.append("    TCP sequence number == destination address: the Mirai scanner fingerprint")
+    return lines, len(hosts_total)
+
+
+def _dns_lines(messages: tuple, reps: list):
+    """DNS queries as 'DNS query for <name> (A)' lines, or None if they aren't all DNS."""
+    lines = []
+    for (raw, _), (low, high) in zip(messages, reps):
+        parsed = _parse_dns_query(raw)
+        if not parsed:
+            return None
+        lines.append(f"DNS query for {parsed[1]} ({_QTYPES.get(parsed[2], parsed[2])})"
+                     + ("" if high == 1 else f"    x{low if low == high else f'{low}-{high}'}"))
+    return lines
+
+
+def _body_lines(proto: str, messages: tuple, reps: list, port: int = 0) -> list:
     """Readable lines for one conversation: a compact summary for text (login attempts, commands),
     otherwise the transcript, plus the printable text found in a binary protocol."""
+    if proto == "udp" and port == 53:
+        dns = _dns_lines(messages, reps)
+        if dns:
+            return dns
     stream = b"".join(strip_ansi(m) * max(hi, 1) for (m, _), (_, hi) in zip(messages, reps))[:1 << 20]
     stripped = any(strip_ansi(m) != m for m, _ in messages)
     summary = line_summary(stream) if printable_ratio(stream) >= 0.9 else None
@@ -232,9 +313,10 @@ class ElfSim(ServiceBase):
     def _sent_data(self, result: Result, report) -> None:
         """A readable transcript of what the sample sent, one entry per distinct conversation
         (a bot that reconnects 76 times with the same registration shows up once, x76)."""
+        self._scanning(result, [c for c in report.sent if c["proto"] == "raw"])
         groups: dict = {}
         for conv in report.sent:
-            if conv["proto"] == "netlink" or not conv["ip"]:
+            if conv["proto"] in ("netlink", "raw") or not conv["ip"]:
                 continue
             # Group on *what* was sent; a repeat count of 2+ (heartbeats) only widens a range,
             # so a session cut short doesn't split an otherwise identical conversation.
@@ -253,12 +335,23 @@ class ElfSim(ServiceBase):
             title = f"-> {proto}://{ip}:{port}"
             if group["connections"] > 1:
                 title += f"   (identical in {group['connections']} connections)"
-            lines = [title] + ["    " + l for l in _body_lines(proto, messages, group["reps"])]
+            lines = [title] + ["    " + l for l in _body_lines(proto, messages, group["reps"], port)]
             blocks.append("\n".join(lines))
 
         section = ResultSection(
             "What the sample sent (control bytes shown as \\xNN)", body="\n\n".join(blocks))
         section.set_heuristic(4, signature="data_sent")
+        result.add_section(section)
+
+    def _scanning(self, result: Result, convs: list) -> None:
+        """Raw sockets with hand-built IP headers: a scanner or flooder. Decoded and summarised,
+        never dumped as bytes."""
+        packets = [(bytes(m), n) for c in convs for m, n in c["messages"]]
+        lines, hosts = _scanning_lines(packets)
+        if not lines:
+            return
+        section = ResultSection("Raw packets the sample built itself (custom IP headers)", body="\n".join(lines))
+        section.set_heuristic(9, signature="syn_scan" if hosts >= SCAN_MIN_HOSTS else "raw_packets")
         result.add_section(section)
 
     def _received(self, request: ServiceRequest, result: Result, report) -> None:

@@ -275,3 +275,15 @@ def test_a_crash_on_the_main_path_is_still_reported_as_a_fault():
     p.raw(b"\xa1" + struct.pack("<I", 0xDEADBEEF))
     r = _run(p)
     assert r.stop_reason == "fault" and r.child_crashes == []
+
+
+def test_raw_socket_sends_are_labelled_raw_not_tcp():
+    p = Prog()
+    dest, pkt = p.d(Prog.sockaddr_in("198.51.100.9", 23)), p.d(b"E\x00\x00\x28" + b"\0" * 36)
+    p.sys(359, 2, 3, 255)                       # socket(AF_INET, SOCK_RAW, IPPROTO_RAW)
+    p.ebx_from_eax()
+    p.mov(1, pkt); p.mov(2, 40); p.mov(6, 0); p.mov(7, dest); p.mov(5, 16); p.mov(0, 369)
+    p.raw(b"\xcd\x80")                          # sendto
+    p.exit(0)
+    (conv,) = _run(p).sent
+    assert conv["proto"] == "raw" and conv["ip"] == "198.51.100.9"
