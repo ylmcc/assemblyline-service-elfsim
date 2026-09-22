@@ -5,8 +5,8 @@ def test_printable_ascii_is_shown_as_is():
     assert readable(b"GET / HTTP/1.1") == "GET / HTTP/1.1"
 
 
-def test_control_bytes_are_escaped_not_hex_dumped():
-    assert readable(b"\x00\x00\x00\x01\x04px86\x03x86") == "\\x00\\x00\\x00\\x01\\x04px86\\x03x86"
+def test_control_bytes_are_a_placeholder_not_hex_dumped():
+    assert readable(b"\x00\x00\x00\x01\x04px86\x03x86") == "·····px86·x86"
 
 
 def test_common_whitespace_and_backslash_are_readable_escapes():

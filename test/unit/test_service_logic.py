@@ -123,10 +123,10 @@ def test_sent_data_is_a_readable_transcript_not_hex():
     (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv(BOT_REGISTRATION)]))
     body = section.body
     assert "-> tcp://198.51.100.7:4444" in body
-    assert "\\x00\\x00\\x00\\x01" in body and "\\x04px86" in body and "\\x03x86" in body
-    assert "\\x00\\x00    x95" in body                      # repeats collapsed, not 95 rows
+    assert "·····px86·x86" in body                # ····  ·px86  ·x86, TCP sends joined
+    assert "··    x95" in body                          # repeats collapsed, not 95 rows
     assert 'readable text: "px86", "x86"' in body
-    assert "000000" not in body.replace("\\x00", "")      # no hex dump anywhere
+    assert "000000" not in body and "\\x" not in body     # no hex dump, no hex escapes anywhere
     assert _score_of(section) == 0
 
 
@@ -151,7 +151,7 @@ def test_netlink_and_addressless_sends_are_not_reported():
 def test_tcp_sends_read_as_one_stream_but_udp_datagrams_stay_separate():
     tcp = _conv([[b"\x00\x00\x00\x01", 1], [b"\x04", 1], [b"px86", 1], [b"\x00\x00", 5]])
     (section,) = _sections(ElfSim._sent_data, _report(sent=[tcp]))
-    assert "    \\x00\\x00\\x00\\x01\\x04px86\n" in section.body        # one stream line
+    assert "    ·····px86\n" in section.body        # one stream line
     udp = _conv([[b"one", 1], [b"two", 1]], proto="udp", port=9999)
     (section,) = _sections(ElfSim._sent_data, _report(sent=[udp]))
     assert "    one\n    two" in section.body                                # datagrams kept apart
@@ -266,7 +266,7 @@ def test_non_shell_execs_and_plain_shell_starts_are_not_extracted(tmp_path, monk
 def test_ansi_colours_are_removed_and_plain_text_gets_no_readable_text_line():
     banner = b"\x1b[0m[\x1b[1;31mSnoopy.\x1b[0m][\x1b[1;31m0.0.0.0\x1b[0m] \x1b[1;31m>\x1b[0m [Unknown]\n"
     (section,) = _sections(ElfSim._sent_data, _report(sent=[_conv([[banner, 1]])] * 147))
-    assert "\\x1b" not in section.body and "[Snoopy.][0.0.0.0] > [Unknown]" in section.body
+    assert "\\x" not in section.body and "[Snoopy.][0.0.0.0] > [Unknown]" in section.body
     assert "readable text" not in section.body and "(identical in 147 connections)" in section.body
     assert "(colour codes removed)" in section.body
 

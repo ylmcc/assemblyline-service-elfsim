@@ -8,9 +8,10 @@ _ESCAPES = {0x5C: "\\\\", 0x0A: "\\n", 0x0D: "\\r", 0x09: "\\t"}
 
 
 def readable(data: bytes, limit: int = 200) -> str:
-    """Printable ASCII as itself; everything else as a short escape (\\x00, \\n, \\\\...).
+    """Printable ASCII as itself; ``\\n``, ``\\r``, ``\\t`` and ``\\`` as their usual escapes; every
+    other non-printable byte as a single ``·`` placeholder (no hex dump).
 
-    ``b"\\x04px86"`` -> ``\\x04px86``. Truncated output ends with the number of bytes left out.
+    ``b"\\x04px86"`` -> ``·px86``. Truncated output ends with the number of bytes left out.
     """
     out = []
     for b in data[:limit]:
@@ -19,7 +20,7 @@ def readable(data: bytes, limit: int = 200) -> str:
         elif 32 <= b < 127:
             out.append(chr(b))
         else:
-            out.append(f"\\x{b:02x}")
+            out.append("·")
     text = "".join(out)
     if len(data) > limit:
         text += f" ... (+{len(data) - limit} more bytes)"

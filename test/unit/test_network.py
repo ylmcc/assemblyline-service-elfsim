@@ -141,7 +141,7 @@ def _received_section(received, tmp_path, monkeypatch):
 def test_small_replies_are_shown_as_text_but_not_extracted(tmp_path, monkeypatch):
     replies = [{"ip": "203.0.113.9", "port": 4444, "data": b"\x00"}] * 40
     (section,), req = _received_section(replies, tmp_path, monkeypatch)
-    assert "<- 203.0.113.9:4444" in section.body and "\\x00    x40" in section.body
+    assert "<- 203.0.113.9:4444" in section.body and "·    x40" in section.body
     assert req.extracted == [] and section.heuristic.score == 0
 
 

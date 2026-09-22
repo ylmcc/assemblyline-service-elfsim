@@ -1,0 +1,155 @@
+{
+  "architecture": "x86",
+  "entry_point": "0x8048100",
+  "stop_reason": "exit(0)",
+  "error": null,
+  "syscalls_total": 14,
+  "syscall_counts": {
+    "prctl": 1,
+    "open": 2,
+    "unlink": 1,
+    "write": 1,
+    "chmod": 1,
+    "socket": 2,
+    "connect": 1,
+    "sendto": 2,
+    "fork": 1,
+    "execve": 1,
+    "exit": 1
+  },
+  "unimplemented_syscalls": {},
+  "events": [
+    {
+      "kind": "process",
+      "syscall": "prctl",
+      "note": "process renamed",
+      "new_name": "scanbot"
+    },
+    {
+      "kind": "file",
+      "syscall": "open",
+      "path": "/dev/watchdog",
+      "note": "special file opened",
+      "flags": "0o2"
+    },
+    {
+      "kind": "file",
+      "syscall": "unlink",
+      "path": "/tmp/sample",
+      "existed": false
+    },
+    {
+      "kind": "file",
+      "syscall": "open",
+      "path": "/tmp/dropped.bin",
+      "note": "created",
+      "flags": "0o101"
+    },
+    {
+      "kind": "file",
+      "syscall": "chmod",
+      "path": "/tmp/dropped.bin",
+      "mode": "0o755",
+      "existed": true
+    },
+    {
+      "kind": "network",
+      "syscall": "connect",
+      "proto": "tcp",
+      "family": "inet",
+      "ip": "198.51.100.7",
+      "port": 4444
+    },
+    {
+      "kind": "network",
+      "syscall": "sendto",
+      "proto": "udp",
+      "family": "inet",
+      "ip": "203.0.113.53",
+      "port": 53,
+      "bytes": 25
+    },
+    {
+      "kind": "network",
+      "syscall": "dns_query",
+      "domain": "c2.test",
+      "qtype": 1
+    },
+    {
+      "kind": "process",
+      "syscall": "fork",
+      "child_pid": 1001
+    },
+    {
+      "kind": "process",
+      "syscall": "execve",
+      "path": "/bin/sh",
+      "argv": [
+        "/bin/sh",
+        "-c",
+        "echo synthetic"
+      ]
+    },
+    {
+      "kind": "process",
+      "syscall": "exit",
+      "code": 0
+    }
+  ],
+  "events_dropped": 0,
+  "network": [
+    {
+      "op": "connect",
+      "proto": "tcp",
+      "family": "inet",
+      "ip": "198.51.100.7",
+      "port": 4444
+    },
+    {
+      "op": "sendto",
+      "proto": "udp",
+      "family": "inet",
+      "ip": "203.0.113.53",
+      "port": 53
+    },
+    {
+      "op": "dns_query",
+      "proto": "udp",
+      "domain": "c2.test",
+      "qtype": 1
+    }
+  ],
+  "sent": [
+    {
+      "proto": "tcp",
+      "ip": "198.51.100.7",
+      "port": 4444,
+      "total_bytes": 8,
+      "messages": [
+        {
+          "text": "HELLO-C2",
+          "hex": "48454c4c4f2d4332",
+          "times": 1
+        }
+      ]
+    },
+    {
+      "proto": "udp",
+      "ip": "203.0.113.53",
+      "port": 53,
+      "total_bytes": 25,
+      "messages": [
+        {
+          "text": "BB\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7c2\u00b7test\u00b7\u00b7\u00b7\u00b7\u00b7",
+          "hex": "42420100000100000000000002633204746573740000010001",
+          "times": 1
+        }
+      ]
+    }
+  ],
+  "received": [],
+  "stdout": "",
+  "files": {
+    "/tmp/dropped.bin": 17
+  }
+}

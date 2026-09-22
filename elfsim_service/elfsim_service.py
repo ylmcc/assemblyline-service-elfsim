@@ -339,7 +339,7 @@ class ElfSim(ServiceBase):
             blocks.append("\n".join(lines))
 
         section = ResultSection(
-            "What the sample sent (control bytes shown as \\xNN)", body="\n\n".join(blocks))
+            "What the sample sent (non-printable bytes shown as ·)", body="\n\n".join(blocks))
         section.set_heuristic(4, signature="data_sent")
         result.add_section(section)
 

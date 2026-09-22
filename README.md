@@ -32,7 +32,7 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | Emulation summary | architecture, entry point, why emulation stopped, syscalls emulated |
 | Network connections attempted | TCP/UDP connects and binds; tags `network.dynamic.ip`, `network.port`, `network.protocol` |
 | DNS lookups | domain parsed from the query and answered with a documentation-range sinkhole so the sample carries on to its real C2 connect; tags `network.dynamic.domain` |
-| What the sample sent | a readable transcript per distinct conversation: control bytes as `\xNN`, adjacent TCP sends joined, repeats as `xN`, plus the printable text found (hex only in the supplementary JSON) |
+| What the sample sent | a readable transcript per distinct conversation: non-printable bytes as `·`, adjacent TCP sends joined, repeats as `xN`, plus the printable text found (hex only in the supplementary JSON) |
 | Process activity | `fork`/`setsid` daemonising, `prctl` renames, `execve` (with argv), `kill`, `ptrace` probes |
 | Extracted scripts | every `sh -c <command>` the sample tried to run is extracted as a script (relation DYNAMIC), so AL sends it to BashSim / PayloadFetcher. A template command (a literal `%s`) has no URL until a live C2 fills it in |
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |

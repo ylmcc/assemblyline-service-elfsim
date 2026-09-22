@@ -133,7 +133,7 @@
       },
       {
         "auto_collapse": false,
-        "body": "-> tcp://198.51.100.7:4444\n    HELLO-C2\n    readable text: \"HELLO-C2\"\n\n-> udp://203.0.113.53:53\n    BB\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x02c2\\x04test\\x00\\x00\\x01\\x00\\x01\n    readable text: \"test\"",
+        "body": "-> tcp://198.51.100.7:4444\n    HELLO-C2\n\n-> udp://203.0.113.53:53\n    DNS query for c2.test (A)",
         "body_config": {},
         "body_format": "TEXT",
         "classification": "TLP:C",
@@ -150,7 +150,7 @@
         },
         "promote_to": null,
         "tags": {},
-        "title_text": "What the sample sent (control bytes shown as \\xNN)",
+        "title_text": "What the sample sent (non-printable bytes shown as \u00b7)",
         "zeroize_on_tag_safe": false
       },
       {
@@ -268,7 +268,7 @@
     "supplementary": [
       {
         "name": "elfsim_report.json",
-        "sha256": "85d64ade501f866b9e9c27ac82d9853928a6e63acc0b016240627407eb41ec15"
+        "sha256": "99726e99919170cd45a17e99f5d2d56ff297421b18a0b650b6421195f2f96749"
       }
     ]
   },
