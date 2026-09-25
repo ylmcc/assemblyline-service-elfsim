@@ -140,3 +140,20 @@ def test_big_endian_arm_is_reported_as_unsupported():
     blob[16:52] = struct.pack(">HHIIIIIHHHHHH", *fields)
     with pytest.raises(UnsupportedElf, match="big-endian is not emulated"):
         emulate(bytes(blob))
+
+
+def test_clone_thread_runs_the_worker_and_the_parent_sleeps_while_it_does():
+    p = ArmProg()
+    area = p.d(b"\0" * 4096)
+    msg_c, msg_m = p.d(b"C"), p.d(b"M")
+    ts = p.d(struct.pack("<II", 0, 1_000_000))
+    p.call("clone", 0xD0F00, area + 4096 - 64, 0, 0, 0)     # CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS
+    p.bnez_r0("parent")
+    p.call("write", 1, msg_c, 1)                            # ---- worker thread
+    p.exit(0)
+    p.label("parent")
+    p.call("nanosleep", ts, 0)                              # blocks, so the worker gets its turn
+    p.call("write", 1, msg_m, 1)
+    p.call("exit_group", 0)
+    r = _run(p)
+    assert r.stdout == b"CM" and r.threads_created == 1

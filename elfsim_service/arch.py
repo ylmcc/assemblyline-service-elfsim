@@ -231,6 +231,7 @@ ARM = Arch(
     uc_cpu=UC_CPU_ARM_CORTEX_A15,
     cpsr_reg=UC_ARM_REG_CPSR,
     setup=_arm_setup,
+    clone_tls_arg=3,                             # clone(flags, stack, ptid, tls, ctid)
     set_tls=lambda uc, addr: uc.reg_write(UC_ARM_REG_C13_C0_3, addr),
     uname_machine="armv7l",
 )
