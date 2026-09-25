@@ -15,7 +15,7 @@ from unicorn import UC_HOOK_INSN, UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
 from unicorn.x86_const import UC_X86_INS_SYSCALL
 
 from elfsim_service.arch import ARCHES, Arch
-from elfsim_service.kernel import PAGE, FakeKernel
+from elfsim_service.kernel import MIN_PATH_SECONDS, PAGE, FakeKernel
 
 STACK_SIZE = 0x100000
 MAX_IMAGE_BYTES = 128 * 1024 * 1024
@@ -196,9 +196,13 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     for reg, value in arch.entry_regs.items():   # e.g. MIPS: $t9 = entry, as PIC-aware startup code expects
         uc.reg_write(reg, entry if value == "entry" else value)
 
+    # A forked path gets a share of the wall clock too: a syscall budget alone can take most of
+    # the run when syscalls are slow (e.g. real network waits), starving the parent paths.
     kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=stack_top - STACK_SIZE,
-                        max_syscalls=max_syscalls, live_net=network)
+                        max_syscalls=max_syscalls, live_net=network,
+                        path_seconds=max(MIN_PATH_SECONDS, timeout_s / 4))
     kernel.exe_path = argv[0]
+    kernel.exe_bytes = data
     report = EmulationReport(arch=arch.name, entry=entry, warnings=warnings)
     fault: dict = {}
 

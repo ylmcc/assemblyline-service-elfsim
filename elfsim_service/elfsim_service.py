@@ -54,6 +54,52 @@ _STOP_TEXT = {
 }
 
 
+# Persistence mechanisms: (signature, description, ATT&CK id, written-path test).
+_PERSIST_PATHS = (
+    ("cron", "cron job", "T1053.003",
+     lambda p: p == "/etc/crontab" or p.startswith(("/etc/cron.", "/etc/cron/", "/var/spool/cron/"))),
+    ("systemd_service", "systemd service", "T1543.002",
+     lambda p: p.startswith(("/etc/systemd/", "/lib/systemd/", "/usr/lib/systemd/"))),
+    ("rc_script", "boot / init script", "T1037.004",
+     lambda p: p in ("/etc/rc.local", "/etc/inittab") or p.startswith(("/etc/init.d/", "/etc/rc.d/",
+                                                                         "/etc/init/", "/etc/rc"))),
+    ("shell_profile", "shell startup file", "T1546.004",
+     lambda p: p in ("/etc/profile", "/etc/bash.bashrc") or p.startswith("/etc/profile.d/")
+     or os.path.basename(p) in (".bashrc", ".profile", ".bash_profile", ".ashrc", ".zshrc", ".bash_login")),
+    ("udev_rule", "udev rule", "T1546.017", lambda p: "/udev/rules.d/" in p),
+    ("dhcp_hook", "DHCP client hook", "T1037",
+     lambda p: p.startswith(("/etc/dhcp/", "/etc/dhclient"))),
+)
+# Commands that install persistence without writing a file we can see: (signature, description,
+# ATT&CK id, substrings any of which marks the command).
+_PERSIST_COMMANDS = (
+    ("cron", "cron job", "T1053.003", ("| crontab", "|crontab", "crontab -e", "crontab /")),
+    ("systemd_service", "systemd service", "T1543.002", ("systemctl enable",)),
+    ("rc_script", "boot / init script", "T1037.004", ("update-rc.d", "chkconfig", "rc-update add")),
+    ("firmware_boot", "router boot setting (nvram/flash)", "T1542",
+     ("nvram set", "flash set", "fw_setenv", "setenv bootcmd")),
+)
+
+
+def _persistence(report) -> list:
+    """(signature, description, ATT&CK id, where) for every persistence mechanism the sample set up."""
+    found = []
+    for path in report.files:
+        for sig, desc, attack, test in _PERSIST_PATHS:
+            if test(path):
+                found.append((sig, desc, attack, path))
+                break
+    for e in report.events:
+        if e["kind"] != "process" or e["syscall"] != "execve":
+            continue
+        cmd = " ".join(e["argv"]) or e["path"]
+        for sig, desc, attack, needles in _PERSIST_COMMANDS:
+            if any(n in cmd for n in needles):
+                found.append((sig, desc, attack, cmd))
+                break
+    return found
+
+
 def _is_local(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
@@ -221,6 +267,7 @@ class ElfSim(ServiceBase):
         self._processes(result, report, argv)
         self._scripts(request, report)
         self._files(request, result, report, argv)
+        self._persistence_section(result, report)
         self._fault(result, report)
         request.result = result
         self._save_report(request, report)
@@ -230,7 +277,7 @@ class ElfSim(ServiceBase):
         stop = report.stop_reason
         if stop.startswith("exit("):
             stop = f"sample exited (exit code {stop[5:-1]})"
-        abandoned = sum(1 for e in report.events if "abandoned" in e.get("note", ""))
+        abandoned = sum(e.get("repeat", 1) for e in report.events if "abandoned" in e.get("note", ""))
         section = ResultKeyValueSection("Emulation summary")
         section.set_item("architecture", report.arch)
         section.set_item("entry_point", hex(report.entry))
@@ -401,20 +448,21 @@ class ElfSim(ServiceBase):
             if e["kind"] != "process":
                 continue
             call = e["syscall"]
+            times = e.get("repeat", 1)
             if call == "execve":
                 cmd = " ".join(e["argv"]) or e["path"]
-                rows[("execve", cmd)] += 1
+                rows[("execve", cmd)] += times
                 sigs[("execve", cmd)] = "execve"
                 commands.add(cmd)
             elif call == "prctl" and e.get("new_name"):
-                rows[("process renamed", e["new_name"])] += 1
+                rows[("process renamed", e["new_name"])] += times
                 sigs[("process renamed", e["new_name"])] = "process_rename"
             elif call == "ptrace":
-                rows[("ptrace", "anti-debug probe")] += 1
+                rows[("ptrace", "anti-debug probe")] += times
                 sigs[("ptrace", "anti-debug probe")] = "anti_debug"
             elif call == "kill":
                 detail = f"signal {e['signal']} to pid {e['pid']}"
-                rows[("kill", detail)] += 1
+                rows[("kill", detail)] += times
                 sigs[("kill", detail)] = "kill_process"
             elif call == "fork" and "child_pid" in e:
                 saw_fork = True
@@ -505,6 +553,19 @@ class ElfSim(ServiceBase):
         table = ResultTableSection("File system activity (simulated, in memory)")
         for row in rows[:MAX_ROWS]:
             table.add_row(row)
+        table.set_heuristic(heur)
+        result.add_section(table)
+
+    def _persistence_section(self, result: Result, report) -> None:
+        found = _persistence(report)
+        if not found:
+            return
+        table = ResultTableSection("Persistence installed (simulated, in memory)")
+        heur = Heuristic(10, attack_ids=sorted({attack for _, _, attack, _ in found}))
+        for sig, desc, _, where in found[:MAX_ROWS]:
+            table.add_row(TableRow(mechanism=desc, location=where))
+        for sig in dict.fromkeys(sig for sig, _, _, _ in found):
+            heur.add_signature_id(sig)
         table.set_heuristic(heur)
         result.add_section(table)
 

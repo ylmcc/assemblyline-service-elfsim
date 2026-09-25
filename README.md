@@ -36,6 +36,7 @@ an in-memory fake kernel, then reports what the sample *tried* to do.
 | Process activity | `fork`/`setsid` daemonising, `prctl` renames, `execve` (with argv), `kill`, `ptrace` probes |
 | Extracted scripts | every `sh -c <command>` the sample tried to run is extracted as a script (relation DYNAMIC), so AL sends it to BashSim / PayloadFetcher. A template command (a literal `%s`) has no URL until a live C2 fills it in |
 | File system activity | files written (extracted with `PARENT_RELATION.DYNAMIC`), `chmod +x`, deletes, watchdog opens |
+| Persistence installed | cron jobs, systemd units, init/rc scripts and `inittab`, shell startup files, udev rules, DHCP hooks, and `crontab`/`nvram set`/`flash set` commands; scored and mapped to ATT&CK |
 | Emulation stopped on a CPU fault | faulting pc, instruction bytes and the reason |
 
 The MIPS (both byte orders), ARM and x86-64 ports were validated on real static `busybox` builds (echo, uname, cat, ls, sleep,
@@ -47,14 +48,26 @@ A full event log is attached as the supplementary file `elfsim_report.json`.
 Heuristics are deliberately quiet. Things a benign daemon also does (DNS lookups, `fork` +
 `setsid`, renaming itself, writing a file) are shown but score 0. Score goes to combinations
 that mean something: exec'ing a program, writing a file then making it executable, deleting
-itself, and a persistent reconnect loop against the same public endpoint.
+itself, installing persistence, and a persistent reconnect loop against the same public endpoint.
 
 ## How it works
 
 `fork()` is handled by snapshotting CPU, memory and the fd table, running the child path
 first, and rewinding to the parent path when the child exits, execs or exhausts its syscall
-budget, so both halves of `if (fork() == 0)` are explored and an idle daemon loop cannot
-starve the rest of the program. Unknown syscalls are answered `-ENOSYS` and reported.
+or wall-clock budget (a quarter of the emulation timeout), so both halves of `if (fork() == 0)`
+are explored and an idle daemon loop cannot starve the rest of the program. Unknown syscalls are
+answered `-ENOSYS` and reported.
+
+The fake filesystem looks enough like a real box for a bot's install routine to run: the sample
+can read its own binary at `argv[0]` / `/proc/self/exe` (bots copy themselves into their install
+locations; without this the whole install and persistence branch is skipped), the usual
+persistence directories exist (`/etc/cron.d`, `/etc/init.d`, `/etc/systemd/system`, udev and DHCP
+hook directories...), `mkdir` creates directories that then exist, and `/dev/shm` is a directory
+rather than a device. Probes for missing paths (`open`, `access`) are logged once each.
+
+In the event log, identical events collapse into one with a `repeat` count, and each syscall
+keeps at most 500 distinct events, so a busy loop (e.g. a `kill(1, 0)` liveness probe run
+thousands of times) cannot push everything else out of the log.
 
 Threads (`clone` with `CLONE_THREAD`, as used by the Go runtime) are cooperative user-level threads
 with their own saved CPU state and TLS: the running thread keeps the CPU until it blocks in a

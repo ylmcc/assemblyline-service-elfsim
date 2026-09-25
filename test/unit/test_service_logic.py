@@ -330,3 +330,32 @@ def test_dns_queries_are_rendered_as_text():
     conv = _conv([[query, 2]], ip="203.0.113.53", port=53, proto="udp")
     (section,) = _sections(ElfSim._sent_data, _report(sent=[conv]))
     assert "DNS query for c2.test (A)    x2" in section.body and "\\x" not in section.body
+
+
+# ---- persistence --------------------------------------------------------------------
+def _persist_sections(files=None, events=()):
+    return _sections(ElfSim._persistence_section, _report(files=files, events=events))
+
+
+def test_persistence_files_and_commands_are_reported_and_scored():
+    files = {"/etc/rc.local": b"/opt/x &\n", "/root/.bashrc": b"/opt/x &\n", "/opt/x": b"\x7fELF",
+             "/etc/cron.d/sync": b"@reboot root /opt/x\n"}
+    events = [_exec("sh", "-c", "(crontab -l; echo '@reboot /opt/x') | crontab - 2>/dev/null"),
+              _exec("sh", "-c", 'nvram set rc_startup="/opt/x &"'),
+              _exec("sh", "-c", "crontab -l 2>/dev/null")]          # only reads: not persistence
+    (section,) = _persist_sections(files, events)
+    locations = [row["location"] for row in section.section_body._data]
+    assert "/opt/x" not in locations and "sh -c crontab -l 2>/dev/null" not in locations
+    assert len(locations) == 5
+    assert set(section.heuristic.attack_ids) == {"T1037.004", "T1546.004", "T1053.003", "T1542"}
+    assert _score_of(section) == 1000     # capped
+
+
+def test_ordinary_dropped_files_are_not_persistence():
+    assert _persist_sections({"/tmp/x": b"data", "/etc/hosts": b"127.0.0.1 localhost\n"}) == []
+
+
+def test_repeated_process_events_count_their_repeats():
+    events = [{"kind": "process", "syscall": "kill", "pid": 1, "signal": 0, "repeat": 4991}]
+    (section,) = _sections(ElfSim._processes, _report(events=events), ["/tmp/sample"])
+    assert section.section_body._data[0]["times"] == 4991

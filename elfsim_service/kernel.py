@@ -10,6 +10,7 @@ from __future__ import annotations
 import ipaddress
 import random
 import struct
+import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -21,6 +22,7 @@ from elfsim_service.arch import Arch
 PAGE = 0x1000
 MMAP_BASE = 0x40000000
 MAX_EVENTS = 5000
+MAX_EVENTS_PER_SYSCALL = 500  # distinct events per syscall, so one busy loop can't fill the whole log
 MAX_SENT_ENTRIES = 200
 MAX_SENT_BYTES = 256 * 1024
 MAX_MESSAGES_PER_CONVERSATION = 60
@@ -33,6 +35,7 @@ MAX_RECEIVED_ENTRIES = 200
 MAX_RECEIVED_BYTES = 2 * 1024 * 1024
 LIVE_MAX_WAIT = 2.0  # real seconds a select()/recv() will wait for data from the real network
 MAX_PATH_SYSCALLS = 20_000  # per forked path, so an idle daemon loop can't starve the parent path
+MIN_PATH_SECONDS = 2.0      # floor for the per-path wall-clock budget the emulator sets
 MAX_MAPPED_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; larger address spaces are only partly restored
 
@@ -42,7 +45,7 @@ SINKHOLE_IP = "192.0.2.53"
 
 EPERM, ENOENT, EBADF, EAGAIN, ENOMEM, EFAULT = 1, 2, 9, 11, 12, 14
 ENODEV, EINVAL, ENOTTY, EFBIG, ENOSYS, EAFNOSUPPORT, EPIPE, ECONNREFUSED = 19, 22, 25, 27, 38, 97, 32, 111
-ETIMEDOUT, EEXIST = 110, 17
+ETIMEDOUT, EEXIST, ETXTBSY = 110, 17, 26
 EPOLLIN, EPOLLOUT, EPOLLET = 0x1, 0x4, 1 << 31
 EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD = 1, 2, 3
 
@@ -70,12 +73,23 @@ _SOCKETCALLS = {
 FAKE_DIRS = {
     "/", "/tmp", "/var", "/var/tmp", "/var/run", "/run", "/mnt", "/root", "/opt", "/home",
     "/dev", "/dev/shm", "/proc", "/sys", "/bin", "/sbin", "/usr", "/usr/bin", "/etc",
+    "/lib", "/usr/lib", "/usr/sbin", "/usr/local", "/usr/local/bin", "/usr/local/lib", "/var/lib",
+    # Persistence locations: bots check these exist before installing into them, so without
+    # them the whole install branch is skipped and never shows up in the report.
+    "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily", "/var/spool/cron", "/var/spool/cron/crontabs",
+    "/etc/init.d", "/etc/rc.d", "/etc/rc.d/init.d", "/etc/init", "/etc/profile.d",
+    "/etc/systemd", "/etc/systemd/system", "/lib/systemd", "/lib/systemd/system",
+    "/etc/udev", "/etc/udev/rules.d", "/lib/udev", "/lib/udev/rules.d",
+    "/etc/dhcp", "/etc/dhcp/dhclient-exit-hooks.d",
 }
 # Read-only files the sample may read; served from memory, never reported as dropped.
 STATIC_FILES = {
     "/proc/mounts": b"rootfs / rootfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ntmpfs /dev/shm tmpfs rw 0 0\n",
     "/proc/cpuinfo": b"processor\t: 0\nmodel name\t: emulated\n",
     "/proc/version": b"Linux version 3.2.0 (emulated)\n",
+    # Opened for writing, these become ordinary written files seeded with this content.
+    "/etc/crontab": b"SHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n",
+    "/etc/inittab": b"::sysinit:/etc/init.d/rcS\n",
 }
 
 # Syscalls seen constantly and never interesting on their own: counted, not logged.
@@ -162,7 +176,7 @@ class Pipe:
 class FakeKernel:
     def __init__(self, uc, arch: Arch, *, brk_base: int, stack_low: int,
                  max_syscalls: int = 200_000, max_path_syscalls: int = MAX_PATH_SYSCALLS,
-                 live_net=None, seed: int = 0x5EED) -> None:
+                 live_net=None, seed: int = 0x5EED, path_seconds: Optional[float] = None) -> None:
         self.uc = uc
         self.arch = arch
         self._bo = "<" if arch.little_endian else ">"   # byte order of guest memory
@@ -172,11 +186,15 @@ class FakeKernel:
         self.received: list[dict] = []
         self._received_bytes = 0
         self.path_syscalls = 0
+        self.path_seconds = path_seconds   # wall-clock budget per forked path (None = unlimited)
+        self.path_started = time.monotonic()
         self.stack_low = stack_low
         self.rng = random.Random(seed)
 
         self.events: list[dict] = []
         self.events_dropped = 0
+        self._event_index: dict = {}        # identical events collapse into one with a repeat count
+        self._events_per_syscall: Counter = Counter()
         self.counts: Counter = Counter()
         self.network: list[dict] = []
         self.files: dict[str, bytearray] = {}
@@ -195,6 +213,9 @@ class FakeKernel:
 
         self.pid, self.ppid = 1000, 1
         self.exe_path = "/tmp/sample"   # what /proc/self/exe points at (argv[0])
+        self.exe_bytes: Optional[bytes] = None   # the sample itself, readable at exe_path
+        self.exe_unlinked = False
+        self.dirs: set[str] = set(FAKE_DIRS)
         self.threads: list = [Thread(tid=self.pid)]
         self.cur: Thread = self.threads[0]
         self.switch_to: Optional[Thread] = None   # thread the run loop must activate next
@@ -218,10 +239,18 @@ class FakeKernel:
 
     # ---------------------------------------------------------------- plumbing
     def log(self, kind: str, name: str, **detail) -> None:
-        if len(self.events) >= MAX_EVENTS:
+        key = (kind, name, repr(sorted(detail.items())))
+        seen = self._event_index.get(key)
+        if seen is not None:
+            seen["repeat"] = seen.get("repeat", 1) + 1
+            return
+        if len(self.events) >= MAX_EVENTS or self._events_per_syscall[name] >= MAX_EVENTS_PER_SYSCALL:
             self.events_dropped += 1
             return
-        self.events.append({"kind": kind, "syscall": name, **detail})
+        self._events_per_syscall[name] += 1
+        event = {"kind": kind, "syscall": name, **detail}
+        self._event_index[key] = event
+        self.events.append(event)
 
     def read(self, addr: int, n: int) -> bytes:
         try:
@@ -387,6 +416,10 @@ class FakeKernel:
         if self._forks and self.path_syscalls > self.max_path_syscalls:
             self.abandon_path("syscall budget exhausted, likely an idle event loop")
             return
+        if (self._forks and self.path_seconds is not None
+                and time.monotonic() - self.path_started > self.path_seconds):
+            self.abandon_path("time budget exhausted, likely an idle event loop")
+            return
 
         handler: Optional[Callable] = getattr(self, f"sys_{name}", None)
         if handler is None:
@@ -480,6 +513,7 @@ class FakeKernel:
         self.uc.context_restore(record["ctx"])
         self._set_result(record["pid"])
         self.path_syscalls = 0
+        self.path_started = time.monotonic()
         return self.current_pc()
 
     @property
@@ -616,6 +650,8 @@ class FakeKernel:
         # memory and the fd table are snapshotted and restored, as a real fork copies them.
         # The fake filesystem and network log stay shared, as they would be on a real box.
         self._forks.append({"ctx": self._save_ctx(), "pid": pid, "snap": self._snapshot()})
+        self.path_syscalls = 0              # the child path gets its own budget
+        self.path_started = time.monotonic()
         self.log("process", "fork", child_pid=pid)
         return 0
 
@@ -1083,23 +1119,40 @@ class FakeKernel:
             path = self.cwd.rstrip("/") + "/" + path
         return path
 
+    def _is_device(self, path: str) -> bool:
+        """/dev entries are devices, except /dev/shm, which is an ordinary tmpfs directory."""
+        return path.startswith("/dev/") and not path.startswith("/dev/shm/")
+
+    def _is_exe(self, path: str) -> bool:
+        """The sample's own binary: bots read it to copy themselves into their install locations."""
+        return (self.exe_bytes is not None and not self.exe_unlinked and path not in self.files
+                and path in (self.exe_path, "/proc/self/exe", f"/proc/{self.pid}/exe"))
+
     def _open(self, path: str, flags: int) -> int:
         path = self._norm(path)
         self.open_counts[path] += 1
+        writing = flags & (O_WRONLY | O_RDWR) or flags & self.arch.o_creat
+        if self._is_exe(path):
+            if writing:
+                return -ETXTBSY   # a running executable can't be opened for writing
+            self.log("file", "open", path=path, note="read its own binary")
+            return self._alloc_fd(OpenFile(path, flags, bytearray(self.exe_bytes)))
         if path in ("/dev/urandom", "/dev/random"):
             return self._alloc_fd(Device("urandom"))
         if path in ("/dev/null", "/dev/zero"):
             return self._alloc_fd(Device("null"))
-        if path in FAKE_DIRS:
+        if path in self.dirs:
             return self._alloc_fd(Device("dir"))
         if path in STATIC_FILES and path not in self.files:
-            return self._alloc_fd(OpenFile(path, flags, bytearray(STATIC_FILES[path])))
-        if path.startswith("/dev/") or path.startswith("/proc/") or path.startswith("/sys/"):
+            if not writing or path.startswith("/proc/"):
+                return self._alloc_fd(OpenFile(path, flags, bytearray(STATIC_FILES[path])))
+            self.files[path] = bytearray(STATIC_FILES[path])   # modified: now reported as written
+            self.log("file", "open", path=path, note="existing file opened for writing", flags=oct(flags))
+        if self._is_device(path) or path.startswith("/proc/") or path.startswith("/sys/"):
             if path not in self._missing_seen and len(self._missing_seen) < 200:
                 self._missing_seen.add(path)
                 self.log("file", "open", path=path, note="special file opened", flags=oct(flags))
             return self._alloc_fd(Device("special"))
-        writing = flags & (O_WRONLY | O_RDWR) or flags & self.arch.o_creat
         if path in self.files or writing:
             if path not in self.files:
                 if len(self.files) >= MAX_FILES:
@@ -1253,7 +1306,9 @@ class FakeKernel:
 
     def sys_unlink(self, path, *_):
         p = self._norm(self.cstr(path))
-        existed = p in self.files
+        existed = p in self.files or self._is_exe(p)
+        if p == self.exe_path:
+            self.exe_unlinked = True
         self.log("file", "unlink", path=p, existed=existed)
         self.files.pop(p, None)
         return 0
@@ -1277,10 +1332,18 @@ class FakeKernel:
         return -ENOENT
 
     def sys_mkdir(self, path, *_):
-        self.log("file", "mkdir", path=self._norm(self.cstr(path)))
+        p = self._norm(self.cstr(path)).rstrip("/") or "/"
+        self.log("file", "mkdir", path=p)
+        if p in self.dirs:
+            return -EEXIST
+        self.dirs.add(p)
         return 0
 
-    sys_rmdir = sys_mkdir
+    def sys_rmdir(self, path, *_):
+        p = self._norm(self.cstr(path)).rstrip("/") or "/"
+        self.log("file", "rmdir", path=p)
+        self.dirs.discard(p)
+        return 0
 
     def sys_chdir(self, path, *_):
         self.cwd = self._norm(self.cstr(path))
@@ -1288,7 +1351,11 @@ class FakeKernel:
 
     def sys_access(self, path, *_):
         p = self._norm(self.cstr(path))
-        known = p in self.files or p in FAKE_DIRS or p in STATIC_FILES or p.startswith("/dev/")
+        known = (p in self.files or p in self.dirs or p in STATIC_FILES or self._is_device(p)
+                 or self._is_exe(p))
+        if not known and p not in self._missing_seen and len(self._missing_seen) < 200:
+            self._missing_seen.add(p)
+            self.log("file", "access", path=p, note="probed, does not exist")
         return 0 if known else -ENOENT
 
     def sys_readlink(self, path, buf, size, *_):
@@ -1317,13 +1384,16 @@ class FakeKernel:
             self._fill_stat(buf, 0o100000 | self.file_modes.get(p, 0o644),
                             len(self.files[p]), is64)
             return 0
-        if p in FAKE_DIRS:
+        if p in self.dirs:
             self._fill_stat(buf, 0o040755, 0, is64)
             return 0
         if p in STATIC_FILES:
             self._fill_stat(buf, 0o100444, len(STATIC_FILES[p]), is64)
             return 0
-        if p.startswith("/dev/"):
+        if self._is_exe(p):
+            self._fill_stat(buf, 0o100755, len(self.exe_bytes), is64)
+            return 0
+        if self._is_device(p):
             self._fill_stat(buf, 0o020666, 0, is64)
             return 0
         return -ENOENT

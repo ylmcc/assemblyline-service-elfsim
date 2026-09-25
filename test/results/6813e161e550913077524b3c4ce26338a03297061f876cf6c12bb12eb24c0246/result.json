@@ -8,7 +8,7 @@
         "body": {
           "architecture": "x86",
           "entry_point": "0x8048100",
-          "runtime_seconds": 0.0,
+          "runtime_seconds": 0.03,
           "stopped_because": "sample exited (exit code 0)",
           "syscalls_emulated": 14
         },
@@ -268,7 +268,7 @@
     "supplementary": [
       {
         "name": "elfsim_report.json",
-        "sha256": "99726e99919170cd45a17e99f5d2d56ff297421b18a0b650b6421195f2f96749"
+        "sha256": "9e30ca4ebd678f15f27ffb95b1753378d3dc213ea6966f9a945867c97965ad3e"
       }
     ]
   },

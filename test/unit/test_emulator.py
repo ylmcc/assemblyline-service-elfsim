@@ -287,3 +287,163 @@ def test_raw_socket_sends_are_labelled_raw_not_tcp():
     p.exit(0)
     (conv,) = _run(p).sent
     assert conv["proto"] == "raw" and conv["ip"] == "198.51.100.9"
+
+
+# ---- filesystem realism: what a bot checks before it installs itself ------------------
+def _errno_of(p: Prog, nr: int, *args: int) -> None:
+    """Run a syscall and write its raw 4-byte return value to stdout."""
+    slot = p.d(b"\0" * 4)
+    p.sys(nr, *args)
+    p.store_eax(slot)
+    p.sys(4, 1, slot, 4)
+
+
+def test_the_sample_can_read_its_own_binary_to_copy_itself():
+    p = Prog()
+    path, buf = p.cstr("/tmp/sample"), p.d(b"\0" * 4)
+    p.sys(5, path, 0)            # open(argv[0], O_RDONLY)
+    p.ebx_from_eax()
+    p.mov(1, buf); p.mov(2, 4); p.mov(0, 3)
+    p.raw(b"\xcd\x80")           # read(fd, buf, 4)
+    p.sys(4, 1, buf, 4)
+    p.exit(0)
+    assert _run(p).stdout == b"\x7fELF"
+
+
+def test_its_own_binary_cannot_be_opened_for_writing():
+    p = Prog()
+    _errno_of(p, 5, p.cstr("/tmp/sample"), 0o1)   # open(argv[0], O_WRONLY)
+    p.exit(0)
+    r = _run(p)
+    assert struct.unpack("<i", r.stdout)[0] == -26     # ETXTBSY
+    assert r.files == {}
+
+
+def test_after_deleting_itself_its_binary_is_gone():
+    p = Prog()
+    path = p.cstr("/tmp/sample")
+    p.sys(10, path)              # unlink(argv[0])
+    _errno_of(p, 33, path, 0)    # access(argv[0], F_OK)
+    p.exit(0)
+    r = _run(p)
+    assert struct.unpack("<i", r.stdout)[0] == -2
+    assert next(e for e in r.events if e["syscall"] == "unlink")["existed"] is True
+
+
+def test_dev_shm_is_an_ordinary_directory_not_a_device():
+    p = Prog()
+    _errno_of(p, 33, p.cstr("/dev/shm/.cache-1"), 0)   # "am I already installed here?"
+    path, body = p.cstr("/dev/shm/.cache-1"), p.d(b"copy")
+    p.sys(5, path, 0o101)
+    p.ebx_from_eax()
+    p.mov(1, body); p.mov(2, 4); p.mov(0, 4)
+    p.raw(b"\xcd\x80")
+    p.exit(0)
+    r = _run(p)
+    assert struct.unpack("<i", r.stdout)[0] == -2
+    assert r.files == {"/dev/shm/.cache-1": b"copy"}
+
+
+@pytest.mark.parametrize("path", ["/etc/cron.d", "/etc/init.d", "/etc/systemd/system", "/var/spool/cron",
+                                  "/etc/dhcp/dhclient-exit-hooks.d", "/etc/udev/rules.d"])
+def test_persistence_directories_exist(path):
+    p = Prog()
+    _errno_of(p, 33, p.cstr(path), 0)
+    p.exit(0)
+    assert struct.unpack("<i", _run(p).stdout)[0] == 0
+
+
+def test_appending_to_etc_crontab_keeps_its_existing_content():
+    p = Prog()
+    path, line = p.cstr("/etc/crontab"), p.d(b"@reboot x\n")
+    p.sys(5, path, 0o2001)       # open(O_WRONLY|O_APPEND)
+    p.ebx_from_eax()
+    p.mov(1, line); p.mov(2, 10); p.mov(0, 4)
+    p.raw(b"\xcd\x80")
+    p.exit(0)
+    content = _run(p).files["/etc/crontab"]
+    assert content.startswith(b"SHELL=/bin/sh\n") and content.endswith(b"@reboot x\n")
+
+
+def test_mkdir_creates_a_directory_that_then_exists():
+    p = Prog()
+    path = p.cstr("/opt/.hidden")
+    _errno_of(p, 33, path, 0)
+    p.sys(39, path, 0o755)       # mkdir
+    _errno_of(p, 33, path, 0)
+    _errno_of(p, 39, path, 0o755)
+    p.exit(0)
+    assert struct.unpack("<3i", _run(p).stdout) == (-2, 0, -17)   # ENOENT, exists, EEXIST
+
+
+def test_access_probes_for_missing_paths_are_logged_once():
+    p = Prog()
+    path = p.cstr("/etc/some-missing-dir")
+    p.sys(33, path, 0)
+    p.sys(33, path, 0)
+    p.exit(0)
+    probes = [e for e in _run(p).events if e["syscall"] == "access"]
+    assert probes == [{"kind": "file", "syscall": "access", "path": "/etc/some-missing-dir",
+                       "note": "probed, does not exist"}]
+
+
+# ---- event log: one busy loop must not crowd everything else out ----------------------
+def test_identical_events_collapse_into_one_with_a_repeat_count():
+    p = Prog()
+    counter = p.d(struct.pack("<I", 6000))
+    p.label("loop")
+    p.sys(37, 1, 0)              # kill(1, 0): a liveness probe loop, as real bots do
+    p.loop_dec(counter, "loop")
+    msg = p.cstr("/etc/after-the-loop")
+    p.sys(33, msg, 0)
+    p.exit(0)
+    r = _run(p)
+    kills = [e for e in r.events if e["syscall"] == "kill"]
+    assert len(kills) == 1 and kills[0]["repeat"] == 6000
+    assert any(e.get("path") == "/etc/after-the-loop" for e in r.events)
+
+
+def test_one_syscall_cannot_fill_the_whole_event_log():
+    from elfsim_service import kernel as K
+    from elfsim_service.arch import ARCHES
+    k = K.FakeKernel(None, next(iter(ARCHES.values())), brk_base=0x10000, stack_low=0)
+    for pid in range(K.MAX_EVENTS * 2):
+        k.log("process", "kill", pid=pid, signal=9)
+    k.log("file", "open", path="/etc/rc.local")
+    assert sum(e["syscall"] == "kill" for e in k.events) == K.MAX_EVENTS_PER_SYSCALL
+    assert k.events[-1]["path"] == "/etc/rc.local"
+
+
+def test_a_slow_child_path_is_abandoned_on_time_even_under_its_syscall_budget(monkeypatch):
+    import functools
+    from elfsim_service import emulator
+    monkeypatch.setattr(emulator, "FakeKernel",
+                        functools.partial(emulator.FakeKernel, max_path_syscalls=10 ** 9))
+    p = Prog()
+    msg = p.d(b"P")
+    p.sys(2)                     # fork
+    p.jnz("parent")
+    p.label("spin")
+    p.sys(158)                   # child: an idle loop that never runs out of syscall budget
+    p.jmp("spin")
+    p.label("parent")
+    p.sys(4, 1, msg, 1)
+    p.exit(0)
+    r = emulate(p.build(), timeout_s=8, max_syscalls=10 ** 9)
+    assert r.stdout == b"P"
+    assert any("time budget" in e.get("note", "") for e in r.events)
+
+
+def test_a_child_forked_late_still_gets_its_own_syscall_budget():
+    p = Prog()
+    counter, msg = p.d(struct.pack("<I", 25_000)), p.d(b"C")
+    p.label("busy")
+    p.sys(158)                   # the root path runs a while before forking
+    p.loop_dec(counter, "busy")
+    p.sys(2)                     # fork
+    p.jnz("parent")
+    p.sys(4, 1, msg, 1)          # the child must get to run, not be abandoned at once
+    p.exit(0)
+    p.label("parent")
+    p.exit(0)
+    assert _run(p, max_syscalls=10 ** 6).stdout == b"C"

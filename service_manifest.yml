@@ -126,6 +126,21 @@ heuristics:
       raw_packets: 0
     attack_id: T1595
 
+  - heur_id: 10
+    name: Persistence installed
+    description: The sample set itself up to survive a reboot or re-login (cron job, init/rc script, systemd service, shell startup file, udev rule, DHCP hook or router boot setting).
+    filetype: ".*"
+    score: 0
+    max_score: 1000
+    signature_score_map:
+      cron: 500
+      systemd_service: 500
+      rc_script: 500
+      shell_profile: 500
+      udev_rule: 500
+      dhcp_hook: 500
+      firmware_boot: 500
+
 docker_config:
   image: kylemc54321/assemblyline-service-elfsim:$SERVICE_TAG
   cpu_cores: 1
