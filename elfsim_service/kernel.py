@@ -37,7 +37,7 @@ LIVE_MAX_WAIT = 2.0  # real seconds a select()/recv() will wait for data from th
 MAX_PATH_SYSCALLS = 20_000  # per forked path, so an idle daemon loop can't starve the parent path
 MIN_PATH_SECONDS = 2.0      # floor for the per-path wall-clock budget the emulator sets
 MAX_MAPPED_BYTES = 128 * 1024 * 1024
-MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; larger address spaces are only partly restored
+MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024  # per fork; regions past this keep the child's contents on rewind
 
 # DNS queries are answered with this documentation-range address (RFC 5737) so a bot that
 # resolves its C2 by name carries on to the real connect() and we learn the port.
@@ -478,13 +478,15 @@ class FakeKernel:
         self.uc.emu_stop()
 
     def _snapshot(self) -> dict:
+        # Every region is recorded so rewind() knows it belonged to the parent; only the first
+        # MAX_SNAPSHOT_BYTES are copied (blob None = not copied). Dropping uncopied regions on
+        # rewind would unmap live parent memory, e.g. a Go heap at 0xc000000000, which sorts last.
         regions, total = [], 0
         for begin, end, perms in self.uc.mem_regions():
             size = end - begin + 1
             total += size
-            if total > MAX_SNAPSHOT_BYTES:
-                break
-            regions.append((begin, size, perms, bytes(self.uc.mem_read(begin, size))))
+            blob = bytes(self.uc.mem_read(begin, size)) if total <= MAX_SNAPSHOT_BYTES else None
+            regions.append((begin, size, perms, blob))
         return {"regions": regions, "fds": dict(self.fds), "brk_cur": self.brk_cur,
                 "brk_mapped_end": self.brk_mapped_end, "mmap_next": self.mmap_next,
                 "mapped_bytes": self.mapped_bytes, "cwd": self.cwd,
@@ -505,7 +507,8 @@ class FakeKernel:
         for begin, size, perms, blob in snap["regions"]:
             if present.get(begin) != size:  # unmapped by the child: bring it back
                 self.uc.mem_map(begin, size, perms)
-            self.uc.mem_write(begin, blob)
+            if blob is not None:            # not copied: keeps whatever the child left there
+                self.uc.mem_write(begin, blob)
         self.fds = dict(snap["fds"])
         self.brk_cur, self.brk_mapped_end = snap["brk_cur"], snap["brk_mapped_end"]
         self.mmap_next, self.mapped_bytes, self.cwd = snap["mmap_next"], snap["mapped_bytes"], snap["cwd"]
@@ -1444,6 +1447,11 @@ class FakeKernel:
             return -EBADF
         self.fds[s32(new)] = obj
         return new
+
+    def sys_dup3(self, old, new, flags=0, *_):
+        if s32(old) == s32(new):        # unlike dup2, dup3 refuses a no-op
+            return -EINVAL
+        return self.sys_dup2(old, new)  # flags is only O_CLOEXEC, which nothing here models
 
     def sys_pipe2(self, ptr, flags, *_):
         return self.sys_pipe(ptr)

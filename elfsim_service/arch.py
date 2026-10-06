@@ -95,7 +95,7 @@ _I386_SYSCALLS = {
     200: "getgid32", 201: "geteuid32", 202: "getegid32", 220: "getdents64",
     221: "fcntl64", 224: "gettid", 240: "futex", 243: "set_thread_area",
     252: "exit_group", 254: "epoll_create", 258: "set_tid_address", 265: "clock_gettime", 295: "openat",
-    291: "inotify_init", 292: "inotify_add_watch", 293: "inotify_rm_watch", 311: "set_robust_list", 355: "getrandom", 359: "socket", 361: "bind", 362: "connect",
+    291: "inotify_init", 292: "inotify_add_watch", 293: "inotify_rm_watch", 311: "set_robust_list", 330: "dup3", 355: "getrandom", 359: "socket", 361: "bind", 362: "connect",
     363: "listen", 364: "accept4", 365: "getsockopt", 366: "setsockopt",
     367: "getsockname", 368: "getpeername", 369: "sendto", 370: "sendmsg",
     371: "recvfrom", 372: "recvmsg", 373: "shutdown",
