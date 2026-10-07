@@ -532,3 +532,120 @@ def test_a_sample_that_keeps_re_execing_itself_identically_is_followed_once():
     p.exit(1)
     r = _run(p)
     assert sum(e["syscall"] == "reexec" for e in r.events) == 1
+
+
+# ---- signals and LinuxThreads ------------------------------------------------------------------
+SIGUSR1, SA_RESTORER = 10, 0x04000000
+
+
+def _handler_at(p: X64Prog, act: int, flag: int, out: bytes = b"H", restorer: bool = False) -> None:
+    """Emit a handler (write `out`, set *flag = 1, return) and point the sigaction at `act` to it."""
+    data_off = act - (p.base + 0x1000)               # DATA_OFF of the builder
+    handler = p.here
+    msg = p.d(out)
+    p.call("write", 1, msg, len(out))
+    p.poke_byte(flag, 1)
+    p.code += b"\xc3"                                 # ret -> restorer / trampoline
+    ret_to, flags = 0, 0
+    if restorer:
+        ret_to, flags = p.here, SA_RESTORER
+        p.code += b"\x48\xc7\xc0\x0f\x00\x00\x00\x0f\x05"   # mov rax, 15 (rt_sigreturn) ; syscall
+    p.data[data_off:data_off + 32] = struct.pack("<QQQQ", handler, flags, ret_to, 0)
+
+
+def _sig_prog(restorer: bool):
+    p = X64Prog()
+    act, flag, m = p.d(b"\0" * 32), p.d(b"\0" * 4), p.d(b"M")
+    p.call("rt_sigaction", SIGUSR1, act, 0, 8)
+    p.call("getpid")
+    p.rdi_from_rax()
+    p.mov(6, SIGUSR1); p.mov(RAX, 62)                 # kill(getpid(), SIGUSR1)
+    p.code += b"\x0f\x05"
+    p.call("write", 1, m, 1)                          # runs after the handler returned
+    p.exit(0)
+    _handler_at(p, act, flag, restorer=restorer)
+    return p
+
+
+def test_a_signal_runs_its_handler_and_resumes_through_the_trampoline():
+    r = _run(_sig_prog(restorer=False))
+    assert r.stdout == b"HM" and r.stop_reason == "exit(0)"
+
+
+def test_a_signal_handler_returns_through_the_samples_own_restorer():
+    r = _run(_sig_prog(restorer=True))
+    assert r.stdout == b"HM" and r.stop_reason == "exit(0)"
+
+
+def test_a_blocked_signal_waits_until_it_is_unblocked():
+    p = X64Prog()
+    act, flag, mask = p.d(b"\0" * 32), p.d(b"\0" * 4), p.d(struct.pack("<Q", 1 << (SIGUSR1 - 1)))
+    a, b = p.d(b"A"), p.d(b"B")
+    p.call("rt_sigaction", SIGUSR1, act, 0, 8)
+    p.call("rt_sigprocmask", 0, mask, 0, 8)           # SIG_BLOCK
+    p.call("getpid")
+    p.rdi_from_rax()
+    p.mov(6, SIGUSR1); p.mov(RAX, 62)
+    p.code += b"\x0f\x05"
+    p.call("write", 1, a, 1)                          # still blocked: no handler yet
+    p.call("rt_sigprocmask", 1, mask, 0, 8)           # SIG_UNBLOCK -> handler runs now
+    p.call("write", 1, b, 1)
+    p.exit(0)
+    _handler_at(p, act, flag)
+    r = _run(p)
+    assert r.stdout == b"AHB"
+
+
+def test_linuxthreads_style_thread_process_pipe_and_restart_signal():
+    """uClibc LinuxThreads: clone(CLONE_VM|FS|FILES|SIGHAND) makes a thread with its own pid; it
+    talks over a pipe and wakes its creator, blocked in sigsuspend, with a signal."""
+    p = X64Prog()
+    act, flag = p.d(b"\0" * 32), p.d(b"\0" * 4)
+    block, none = p.d(struct.pack("<Q", 1 << (SIGUSR1 - 1))), p.d(b"\0" * 8)
+    fds, buf, msg = p.d(b"\0" * 8), p.d(b"\0" * 8), p.d(b"hi")
+    child_pid, child_ppid = p.d(b"\0" * 8), p.d(b"\0" * 8)
+    stack = p.d(b"\0" * 0x2000) + 0x2000
+    p.call("rt_sigaction", SIGUSR1, act, 0, 8)
+    p.call("rt_sigprocmask", 0, block, 0, 8)          # restart signal blocked outside sigsuspend
+    p.call("pipe", fds)                               # fds 3 (read) and 4 (write)
+    p.call("clone", 0xF00, stack, 0, 0, 0)
+    p.jnz("parent")
+    p.call("getpid"); p.store_rax(child_pid)          # child (thread-process)
+    p.call("getppid"); p.store_rax(child_ppid)
+    p.call("write", 4, msg, 2)
+    p.call("kill", 1000, SIGUSR1)                     # restart the creator
+    p.call("exit", 0)
+    p.label("parent")
+    p.label("wait")
+    p.call("rt_sigsuspend", none, 8)                  # everything unblocked while waiting
+    p.code += b"\x0f\xb6\x04\x25" + struct.pack("<I", flag)   # movzx eax, byte [flag]
+    p.code += b"\x48\x83\xf0\x01"                     # xor rax, 1 -> 0 once the handler ran
+    p.jnz("wait")
+    p.call("read", 3, buf, 2)
+    p.call("write", 1, buf, 2)
+    p.call("write", 1, child_pid, 8)
+    p.call("write", 1, child_ppid, 8)
+    p.exit(0)
+    _handler_at(p, act, flag, out=b"")
+    r = _run(p)
+    assert r.stdout[:2] == b"hi" and r.stop_reason == "exit(0)"
+    pid, ppid = struct.unpack("<QQ", r.stdout[2:18])
+    assert ppid == 1000 and pid not in (0, 1000)      # its own pid; its creator as parent
+
+
+def test_poll_waits_for_another_thread_to_write_the_pipe():
+    p = X64Prog()
+    fds, pfd, res, msg = p.d(b"\0" * 8), p.d(struct.pack("<ihh", 3, 1, 0)), p.d(b"\0" * 8), p.d(b"x")
+    stack = p.d(b"\0" * 0x2000) + 0x2000
+    p.call("pipe", fds)
+    p.call("clone", 0x10F00, stack, 0, 0, 0)          # a CLONE_THREAD thread: the parent runs on first
+    p.jnz("parent")
+    p.call("write", 4, msg, 1)                        # child writes, then leaves
+    p.call("exit", 0)
+    p.label("parent")
+    p.call("poll", pfd, 1, 5000)                      # nothing yet: must wait, not time out
+    p.store_rax(res)
+    p.call("write", 1, res, 8)
+    p.exit(0)
+    r = _run(p)
+    assert struct.unpack("<Q", r.stdout)[0] == 1

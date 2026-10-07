@@ -55,6 +55,17 @@ MAP_FIXED, MAP_ANONYMOUS = 0x10, 0x20
 CLONE_VM = 0x100
 CLONE_THREAD, CLONE_SETTLS, CLONE_PARENT_SETTID = 0x10000, 0x80000, 0x100000
 CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID = 0x200000, 0x1000000
+CLONE_VFORK = 0x4000
+SA_NODEFER, SA_RESTORER = 0x40000000, 0x04000000
+SIG_DFL, SIG_IGN = 0, 1
+# Signals whose default action is to do nothing: an unhandled one is simply discarded.
+_SIG_DEFAULT_IGNORE = {17, 18, 23, 28}            # SIGCHLD, SIGCONT, SIGURG, SIGWINCH
+NO_RESULT = object()                               # handler already set up the registers itself
+# Code for "rt_sigreturn" a signal handler returns into when the sample gave no sa_restorer.
+_SIGRETURN_TRAMPOLINE = {
+    "x86_64": b"\x48\xc7\xc0\x0f\x00\x00\x00\x0f\x05",    # mov rax, 15 ; syscall
+    "arm": b"\xad\x70\xa0\xe3\x00\x00\x00\xef",            # mov r7, #173 ; svc #0
+}
 MAX_THREADS = 64
 SOCK_STREAM, SOCK_DGRAM, SOCK_RAW = 1, 2, 3
 AF_UNIX, AF_INET, AF_NETLINK, AF_INET6 = 1, 2, 16, 10
@@ -130,6 +141,14 @@ class Thread:
     seq: int = 0                          # order in which threads blocked (FIFO futex wake-up)
     restart: bool = False                 # woken by readiness: re-run the blocked syscall
     restart_nr: int = 0                   # ...whose syscall number was this
+    pid: Optional[int] = None             # own pid for a LinuxThreads thread (clone without CLONE_THREAD)
+    ppid: Optional[int] = None            # ...and its creator's pid
+    sigmask: int = 0                      # blocked signals (bit n-1 = signal n)
+    suspend_mask: Optional[int] = None    # the temporary mask while in sigsuspend()
+    pending: list = field(default_factory=list)   # signals sent to this thread, not yet delivered
+    frames: list = field(default_factory=list)    # saved state of handlers it is running
+    deliver: bool = False                 # set up a handler for a pending signal when next activated
+    sigreturn: bool = False               # restore the innermost handler frame when next activated
 
 
 @dataclass
@@ -200,6 +219,9 @@ class FakeKernel:
         self.network: list[dict] = []
         self.files: dict[str, bytearray] = {}
         self.symlinks: dict[str, str] = {}      # link path -> target
+        self.sigactions: dict[int, tuple] = {}  # signal -> (handler, flags, restorer, mask)
+        self._trampoline: Optional[int] = None
+        self.signals_delivered = 0
         self.reexecs: list[dict] = []          # {path, argv} of execve()s of the sample's own image
         self.file_modes: dict[str, int] = {}
         self.stdout = bytearray()
@@ -440,7 +462,8 @@ class FakeKernel:
             except Exception as e:  # a handler bug must not take down the whole analysis
                 ret = -ENOSYS
                 self.log("system", name, note=f"internal error in handler: {type(e).__name__}: {e}")
-        self._set_result(ret)
+        if ret is not NO_RESULT:
+            self._set_result(ret)
 
     def _set_result(self, ret: int) -> None:
         """Deliver a syscall result in the arch's convention. Handlers return a value or
@@ -608,6 +631,14 @@ class FakeKernel:
                               self.uc.reg_read(self.arch.pc_reg) - self.arch.syscall_insn_len)
         elif nxt.pending_ret is not None:
             self._set_result(nxt.pending_ret)
+        if nxt.sigreturn:                         # handler finished: back to where it interrupted
+            frame = nxt.frames.pop()
+            self.uc.context_restore(frame["ctx"])
+            nxt.sigmask, nxt.sigreturn = frame["mask"], False
+            nxt.deliver = self._deliverable(nxt) is not None
+        if nxt.deliver or (nxt.state != "dead" and self._deliverable(nxt) is not None):
+            nxt.deliver = False
+            self._push_signal_frame(nxt)
         nxt.restart = False
         nxt.pending_ret, nxt.state, nxt.wait_addr, nxt.wake_at = None, "ready", None, None
         if old.state == "dead":
@@ -640,6 +671,8 @@ class FakeKernel:
         return self.sys_exit_group(code)
 
     def sys_exit_group(self, code, *_):
+        if self.cur.pid and self.cur is not self.threads[0]:      # a LinuxThreads thread-process
+            return self.sys_exit(code)
         self.log("process", "exit", code=s32(code))
         self._end_process(f"exit({s32(code)})")
         return 0
@@ -664,6 +697,24 @@ class FakeKernel:
     sys_vfork = sys_fork
 
     def sys_clone(self, flags, stack=0, ptid=0, a3=0, a4=0, *_):
+        if (flags & CLONE_VM and not flags & (CLONE_THREAD | CLONE_VFORK)
+                and self.arch.clone_tls_arg is not None and len(self.threads) < MAX_THREADS):
+            # LinuxThreads (old uClibc): a "thread" is a process sharing our memory, with its own
+            # pid, talking to the others through pipes and signals. Run it as a cooperative
+            # thread that reports its own pid and its creator as parent.
+            tid = self._next_pid
+            self._next_pid += 1
+            creator = self.cur.pid or self.pid
+            th = Thread(tid=tid, pid=tid, ppid=creator, ctx=self._save_ctx(), state="ready",
+                        setup={"sp": stack, "tls": None}, sigmask=self.cur.sigmask)
+            self.threads.append(th)
+            self.threads_created += 1
+            if len(self.threads) == 2:
+                self.replan = True
+                self.uc.emu_stop()
+            if self.threads_created <= 8:
+                self.log("process", "clone", note="thread-process created (LinuxThreads style)", tid=tid)
+            return tid
         if flags & CLONE_VM and not flags & CLONE_THREAD:
             # posix_spawn()/system(): a vfork-style clone. Treat it as a fork; the child runs on the
             # stack it was given, which is where the libc stub expects to find its function and args.
@@ -733,17 +784,21 @@ class FakeKernel:
         return self.sys_waitpid(pid, status_ptr)
 
     def sys_kill(self, pid, sig, *_):
+        target = self._signal_target(s32(pid))
+        if target is not None:                    # one of our own (LinuxThreads) threads
+            self._send_signal(target, s32(sig))
+            return 0
         self.log("process", "kill", pid=s32(pid), signal=s32(sig))
         return 0
 
     def sys_getpid(self, *_):
-        return self.pid
+        return self.cur.pid or self.pid
 
     def sys_gettid(self, *_):
         return self.cur.tid
 
     def sys_getppid(self, *_):
-        return self.ppid
+        return self.cur.ppid or self.ppid
 
     def sys_getuid(self, *_):
         return 0
@@ -801,10 +856,123 @@ class FakeKernel:
             return self._futex_wake(uaddr, val & 0xFFFFFFFF)
         return -ENOSYS
 
-    def sys_tgkill(self, *_):
+    def sys_tgkill(self, tgid, tid, sig=0, *_):
+        target = next((t for t in self.threads if t.tid == tid and t.state != "dead"), None)
+        if target is not None:
+            self._send_signal(target, s32(sig))
         return 0                                              # runtimes signal their own threads (preemption)
 
-    sys_tkill = sys_tgkill
+    def sys_tkill(self, tid, sig, *_):
+        return self.sys_tgkill(0, tid, sig)
+
+    # ---------------------------------------------------------------- signal delivery
+    def _signal_target(self, pid: int) -> Optional[Thread]:
+        for t in self.threads:
+            if t.state != "dead" and (t.pid or self.pid) == pid and (t.pid or t is self.threads[0]):
+                return t
+        return None
+
+    def _send_signal(self, t: Thread, sig: int) -> None:
+        if not 0 < sig < 65 or self.arch.name not in _SIGRETURN_TRAMPOLINE:
+            return
+        handler = self.sigactions.get(sig, (SIG_DFL, 0, 0, 0))[0]
+        if handler == SIG_IGN or (handler == SIG_DFL and sig in _SIG_DEFAULT_IGNORE):
+            return
+        if sig not in t.pending:
+            t.pending.append(sig)
+        if t.state == "signal" and self._deliverable(t) is not None:
+            t.state, t.pending_ret = "ready", -4            # sigsuspend()/pause() return EINTR
+        if t is self.cur and self._deliverable(t) is not None:
+            self.cur.deliver = True
+            self.switch_to = self.cur
+            self.uc.emu_stop()
+
+    def _deliverable(self, t: Thread) -> Optional[int]:
+        mask = t.suspend_mask if t.suspend_mask is not None else t.sigmask
+        for sig in t.pending:
+            if not mask >> (sig - 1) & 1 and self.sigactions.get(sig, (SIG_DFL,))[0] not in (SIG_DFL, SIG_IGN):
+                return sig
+        return None
+
+    def _sig_trampoline(self) -> int:
+        if self._trampoline is None:
+            addr = self._pick_address(PAGE)
+            if addr is not None and self._map(addr, PAGE):
+                self.uc.mem_write(addr, _SIGRETURN_TRAMPOLINE[self.arch.name])
+                self._trampoline = addr
+        return self._trampoline or 0
+
+    def _push_signal_frame(self, t: Thread) -> None:
+        """Run the handler of t's first deliverable signal: save its state (restored by
+        rt_sigreturn) and enter handler(sig, &siginfo, &ucontext) on its stack."""
+        sig = self._deliverable(t)
+        if sig is None:
+            return
+        t.pending.remove(sig)
+        handler, flags, restorer, sa_mask = self.sigactions[sig]
+        t.frames.append({"ctx": self.uc.context_save(), "mask": t.sigmask})
+        t.suspend_mask = None
+        t.sigmask |= sa_mask | (0 if flags & SA_NODEFER else 1 << (sig - 1))
+        ret_to = restorer if flags & SA_RESTORER and restorer else self._sig_trampoline()
+        uc, a, w = self.uc, self.arch, self.arch.word_size
+        sp = (uc.reg_read(a.sp_reg) - 128) & ~0xF       # skip the red zone
+        uctx = sp = sp - 1024
+        info = sp = sp - 128
+        self.write(info, b"\0" * (128 + 1024))
+        self.write(info, struct.pack(self._bo + "iii", sig, 0, -6))   # si_signo, si_errno, si_code=SI_TKILL
+        sp &= ~0xF
+        if a.name == "x86_64":
+            sp -= 8
+            self.put_uptr(sp, ret_to)                     # return address of the handler
+            from unicorn.x86_const import UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX
+            uc.reg_write(UC_X86_REG_RDI, sig); uc.reg_write(UC_X86_REG_RSI, info); uc.reg_write(UC_X86_REG_RDX, uctx)
+        else:                                             # arm: r0-r2 arguments, lr = return
+            from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_LR
+            uc.reg_write(UC_ARM_REG_R0, sig); uc.reg_write(UC_ARM_REG_R1, info); uc.reg_write(UC_ARM_REG_R2, uctx)
+            uc.reg_write(UC_ARM_REG_LR, ret_to)
+            cpsr = uc.reg_read(a.cpsr_reg)
+            uc.reg_write(a.cpsr_reg, cpsr | 0x20 if handler & 1 else cpsr & ~0x20)
+            handler &= ~1
+        uc.reg_write(a.sp_reg, sp)
+        uc.reg_write(a.pc_reg, handler)
+        if len(t.frames) <= 1 and self.signals_delivered < 8:
+            self.log("process", "signal", note="signal handler run", signal=sig)
+        self.signals_delivered += 1
+
+    def sys_rt_sigaction(self, sig, act, oact, *_):
+        sig = s32(sig)
+        old = self.sigactions.get(sig, (SIG_DFL, 0, 0, 0))
+        w = self.arch.word_size
+        if oact and self.arch.name in _SIGRETURN_TRAMPOLINE:
+            self.write(oact, self.pack_words(*old[:3]) + struct.pack(self._bo + "Q", old[3]))
+        if act and self.arch.name in _SIGRETURN_TRAMPOLINE:
+            handler, flags, restorer = self.read_words(act, 3)
+            (mask,) = struct.unpack(self._bo + "Q", self.read(act + 3 * w, 8))
+            self.sigactions[sig] = (handler, flags, restorer, mask)
+        return 0
+
+    def sys_rt_sigprocmask(self, how, nset, oset, *_):
+        t = self.cur
+        if oset:
+            self.write(oset, struct.pack(self._bo + "Q", t.sigmask))
+        if nset:
+            (m,) = struct.unpack(self._bo + "Q", self.read(nset, 8))
+            t.sigmask = t.sigmask | m if how == 0 else t.sigmask & ~m if how == 1 else m
+            t.sigmask &= ~((1 << 8) | (1 << 18))          # SIGKILL and SIGSTOP cannot be blocked
+            if self._deliverable(t) is not None:          # unblocking may release a pending signal
+                t.deliver = True
+                self.switch_to = t
+                self.uc.emu_stop()
+        return 0
+
+    def sys_rt_sigreturn(self, *_):
+        t = self.cur
+        if not t.frames:
+            return 0
+        t.sigreturn = True
+        self.switch_to = t
+        self.uc.emu_stop()
+        return NO_RESULT
 
     def sys_times(self, buf, *_):
         if buf:
@@ -905,16 +1073,22 @@ class FakeKernel:
     def sys_sigaction(self, *_):
         return 0
 
-    sys_rt_sigaction = sys_rt_sigprocmask = sys_signal = sys_sigaction
-    sys_sigreturn = sys_rt_sigreturn = sys_sigaction
+    sys_signal = sys_sigaction
+    sys_sigreturn = sys_sigaction
 
     def sys_alarm(self, *_):
         return 0
 
     def _wait_for_signal(self, call: str) -> int:
-        """pause()/sigsuspend(): sleep until a signal arrives. Nothing here ever delivers one, so
-        the caller would wait forever -- returning at once (as these used to) made guardian loops
-        spin through the whole syscall budget. Let other threads run; with none, the path ends."""
+        """pause()/sigsuspend(): sleep until a signal arrives. Returning at once (as these used to)
+        made guardian loops spin through the whole syscall budget. A signal already pending is
+        handled now; otherwise other threads run (one may signal us); with none, nothing ever
+        will, so the path ends."""
+        if self._deliverable(self.cur) is not None:
+            self.cur.deliver = True
+            self.switch_to = self.cur
+            self.uc.emu_stop()
+            return -4                                     # EINTR, after the handler runs
         if len(self.threads) > 1:
             return self._block("signal")
         self.log("process", call, note="waits for a signal that never comes; this process path ends")
@@ -924,7 +1098,9 @@ class FakeKernel:
     def sys_pause(self, *_):
         return self._wait_for_signal("pause")
 
-    def sys_rt_sigsuspend(self, *_):
+    def sys_rt_sigsuspend(self, mask=0, *_):
+        if mask and self.arch.name in _SIGRETURN_TRAMPOLINE:
+            (self.cur.suspend_mask,) = struct.unpack(self._bo + "Q", self.read(mask, 8))
         return self._wait_for_signal("sigsuspend")
 
     sys_sigsuspend = sys_rt_sigsuspend
@@ -1756,6 +1932,12 @@ class FakeKernel:
                     rev |= POLLOUT
             self.write(fds + 8 * i + 6, struct.pack(self._bo + "h", rev))
             ready += 1 if rev else 0
+        if not ready and s32(timeout) != 0 and len(self.threads) > 1:
+            # Another thread may write to one of these fds (e.g. a LinuxThreads manager polling
+            # its request pipe): wait for it. Woken by data it is re-run (x86-64; elsewhere it
+            # returns 0 and the caller polls again); woken by the timeout it returns 0.
+            self.cur.restart_nr = self.uc.reg_read(self.arch.nr_reg)
+            return self._block("epoll", until=None if s32(timeout) < 0 else self.vtime + s32(timeout) / 1000)
         if not ready and s32(timeout) > 0:
             self.vtime += s32(timeout) / 1000
         return ready
