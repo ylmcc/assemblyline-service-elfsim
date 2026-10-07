@@ -359,3 +359,12 @@ def test_repeated_process_events_count_their_repeats():
     events = [{"kind": "process", "syscall": "kill", "pid": 1, "signal": 0, "repeat": 4991}]
     (section,) = _sections(ElfSim._processes, _report(events=events), ["/tmp/sample"])
     assert section.section_body._data[0]["times"] == 4991
+
+
+def test_symlinks_into_rc_directories_count_as_boot_persistence():
+    from elfsim_service.elfsim_service import _persistence
+    report = SimpleNamespace(files={}, events=[
+        {"kind": "file", "syscall": "symlink", "path": "/etc/rc2.d/S90svc", "target": "../init.d/svc"},
+        {"kind": "file", "syscall": "symlink", "path": "/tmp/harmless-link", "target": "/tmp/x"},
+    ])
+    assert _persistence(report) == [("rc_script", "boot / init script", "T1037.004", "/etc/rc2.d/S90svc")]

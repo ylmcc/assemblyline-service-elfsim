@@ -84,7 +84,9 @@ _PERSIST_COMMANDS = (
 def _persistence(report) -> list:
     """(signature, description, ATT&CK id, where) for every persistence mechanism the sample set up."""
     found = []
-    for path in report.files:
+    # Files written, plus symlinks created (e.g. /etc/rc2.d/S90x -> ../init.d/x enables a boot script).
+    links = [e["path"] for e in report.events if e["kind"] == "file" and e["syscall"] == "symlink"]
+    for path in list(report.files) + [p for p in links if p not in report.files]:
         for sig, desc, attack, test in _PERSIST_PATHS:
             if test(path):
                 found.append((sig, desc, attack, path))

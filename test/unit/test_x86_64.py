@@ -424,3 +424,111 @@ def test_dup3_duplicates_like_dup2_but_rejects_the_same_fd():
     r = _run(p)
     assert r.stdout == b"hi" + struct.pack("<q", -22)       # -EINVAL
     assert r.unknown_syscalls == {}
+
+
+# ---- waiting for signals, symlinks, re-exec of its own image -----------------------------------
+def test_sigsuspend_ends_the_path_instead_of_spinning_and_the_parent_still_runs():
+    """Nothing delivers signals here, so a guardian's `for(;;) sigsuspend()` waits forever. It
+    used to return at once and burn the whole syscall budget."""
+    p = X64Prog()
+    out = p.d(b"P")
+    p.call("fork")
+    p.jnz("parent")
+    p.label("spin")                                   # child: for (;;) sigsuspend(&mask)
+    p.call("rt_sigsuspend", 0, 8)
+    p.mov(RAX, 1)
+    p.jnz("spin")
+    p.label("parent")
+    p.call("write", 1, out, 1)
+    p.exit(0)
+    r = _run(p)
+    assert r.stdout == b"P" and r.stop_reason == "exit(0)"
+    assert r.syscall_counts["rt_sigsuspend"] == 1 and r.unknown_syscalls == {}
+
+
+def test_pause_in_the_only_process_ends_the_run():
+    p = X64Prog()
+    p.label("spin")
+    p.call("pause")
+    p.mov(RAX, 1)
+    p.jnz("spin")
+    r = _run(p)
+    assert r.stop_reason == "pause (waits forever)" and r.syscall_counts["pause"] == 1
+
+
+def test_symlink_is_recorded():
+    p = X64Prog()
+    target, link = p.cstr("../init.d/svc"), p.cstr("/etc/rc2.d/S90svc")
+    p.call("symlink", target, link)
+    p.exit(0)
+    r = _run(p)
+    ev = next(e for e in r.events if e["syscall"] == "symlink")
+    assert (ev["path"], ev["target"]) == ("/etc/rc2.d/S90svc", "../init.d/svc") and r.unknown_syscalls == {}
+
+
+def _reexec_prog(second_argv_word: bytes):
+    """argc == 1: execve(own path, ["svc", <word>]) ; otherwise write argv[1][0] and exit."""
+    p = X64Prog()
+    own, a0, a1 = p.cstr("/tmp/sample"), p.cstr("svc"), p.cstr(second_argv_word.decode())
+    argv = p.ptrs(a0, a1, 0)
+    p.load_stack_word(0)                              # argc
+    p.code += b"\x48\x83\xe8\x01"                     # sub rax, 1
+    p.jnz("second")
+    p.call("execve", own, argv, 0)
+    p.exit(1)
+    p.label("second")
+    p.load_stack_word(16)                             # argv[1]
+    p.code += b"\x48\x89\xc6"                         # mov rsi, rax
+    p.mov(7, 1); p.mov(2, 1); p.mov(RAX, 1)           # write(1, argv[1], 1)
+    p.code += b"\x0f\x05"
+    p.exit(0)
+    return p
+
+
+def test_reexec_of_its_own_image_is_emulated_with_the_new_argv():
+    r = _run(_reexec_prog(b"guardian"))
+    assert r.stdout == b"g" and r.stop_reason == "exit(0)"
+    reexec = next(e for e in r.events if e["syscall"] == "reexec")
+    assert reexec["argv"] == ["svc", "guardian"] and reexec["path"] == "/tmp/sample"
+
+
+def test_reexec_of_a_copy_it_wrote_of_itself_is_followed_too():
+    """Bots copy themselves (here via /proc/self/exe) and exec the copy: that is still its image."""
+    import struct as _s
+    p = X64Prog()
+    own, copy = p.cstr("/proc/self/exe"), p.cstr("/tmp/.copy")
+    slot, nbytes, a0, a1 = p.d(b"\0" * 8), p.d(b"\0" * 8), p.cstr("svc"), p.cstr("x")
+    argv = p.ptrs(a0, a1, 0)
+    mov_mem = lambda reg_code, addr: b"\x48\x8b" + bytes([0x04 | reg_code << 3]) + b"\x25" + _s.pack("<I", addr)
+    p.load_stack_word(0)
+    p.code += b"\x48\x83\xe8\x01"                     # sub rax, 1
+    p.jnz("second")
+    p.call("open", own, 0, 0)                         # fd 3
+    p.call("mmap", 0, 0x100000, 3, 0x22, 0xFFFFFFFFFFFFFFFF, 0)
+    p.store_rax(slot)
+    p.code += mov_mem(6, slot)                        # rsi = buffer
+    p.mov(7, 3); p.mov(2, 0x100000); p.mov(RAX, 0)    # read(3, buf, 1 MiB)
+    p.code += b"\x0f\x05"
+    p.store_rax(nbytes)
+    p.call("open", copy, 0o1101, 0o755)               # fd 4: O_WRONLY|O_CREAT|O_TRUNC
+    p.code += mov_mem(6, slot) + mov_mem(2, nbytes)   # rsi = buffer, rdx = bytes read
+    p.mov(7, 4); p.mov(RAX, 1)                        # write(4, buf, n)
+    p.code += b"\x0f\x05"
+    p.call("execve", copy, argv, 0)
+    p.exit(1)
+    p.label("second")
+    p.call("write", 1, a1, 1)
+    p.exit(0)
+    r = emulate(p.build(), timeout_s=10)
+    assert r.stdout == b"x" and r.stop_reason == "exit(0)"
+    assert any(e["syscall"] == "reexec" and e["path"] == "/tmp/.copy" for e in r.events)
+
+
+def test_a_sample_that_keeps_re_execing_itself_identically_is_followed_once():
+    p = X64Prog()
+    own, a0 = p.cstr("/tmp/sample"), p.cstr("svc")
+    argv = p.ptrs(a0, 0)
+    p.call("execve", own, argv, 0)                    # argc is always 1: it re-execs forever
+    p.exit(1)
+    r = _run(p)
+    assert sum(e["syscall"] == "reexec" for e in r.events) == 1

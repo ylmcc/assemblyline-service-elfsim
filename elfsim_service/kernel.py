@@ -30,6 +30,7 @@ MAX_MESSAGE_BYTES = 2048
 MAX_STDOUT = 64 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_FILES = 50
+MAX_REEXECS = 3            # re-execs of the sample's own image that get emulated too
 MAX_FORKS = 16
 MAX_RECEIVED_ENTRIES = 200
 MAX_RECEIVED_BYTES = 2 * 1024 * 1024
@@ -198,6 +199,8 @@ class FakeKernel:
         self.counts: Counter = Counter()
         self.network: list[dict] = []
         self.files: dict[str, bytearray] = {}
+        self.symlinks: dict[str, str] = {}      # link path -> target
+        self.reexecs: list[dict] = []          # {path, argv} of execve()s of the sample's own image
         self.file_modes: dict[str, int] = {}
         self.stdout = bytearray()
         self.sent: list[dict] = []
@@ -706,8 +709,20 @@ class FakeKernel:
                 break
             args.append(self.cstr(ptr, 1024))
         self.log("process", "execve", path=p, argv=args)
+        if (self._is_own_binary(p) and len(self.reexecs) < MAX_REEXECS
+                and all(r["argv"] != args for r in self.reexecs)):
+            # Bots re-exec themselves in another mode (e.g. "<name> --guardian"): emulate that image
+            # too, after this one finishes (see emulator.emulate), instead of losing it.
+            self.reexecs.append({"path": self._norm(p), "argv": args})
         self._end_process("execve")
         return 0
+
+    def _is_own_binary(self, path: str) -> bool:
+        """The sample's own image: its own path, /proc/self/exe, or a copy it wrote of itself."""
+        p = self._norm(path)
+        if p in (self.exe_path, "/proc/self/exe", f"/proc/{self.pid}/exe"):
+            return self.exe_bytes is not None
+        return self.exe_bytes is not None and p in self.files and bytes(self.files[p]) == self.exe_bytes
 
     def sys_waitpid(self, pid, status_ptr, *_):
         if status_ptr:
@@ -896,9 +911,23 @@ class FakeKernel:
     def sys_alarm(self, *_):
         return 0
 
+    def _wait_for_signal(self, call: str) -> int:
+        """pause()/sigsuspend(): sleep until a signal arrives. Nothing here ever delivers one, so
+        the caller would wait forever -- returning at once (as these used to) made guardian loops
+        spin through the whole syscall budget. Let other threads run; with none, the path ends."""
+        if len(self.threads) > 1:
+            return self._block("signal")
+        self.log("process", call, note="waits for a signal that never comes; this process path ends")
+        self._end_process(f"{call} (waits forever)")
+        return -4  # EINTR, never seen: the path is over
+
     def sys_pause(self, *_):
-        self.vtime += 3600
-        return -4  # EINTR
+        return self._wait_for_signal("pause")
+
+    def sys_rt_sigsuspend(self, *_):
+        return self._wait_for_signal("sigsuspend")
+
+    sys_sigsuspend = sys_rt_sigsuspend
 
     # ---------------------------------------------------------------- time
     def sys_time(self, tptr, *_):
@@ -1315,6 +1344,15 @@ class FakeKernel:
         self.log("file", "unlink", path=p, existed=existed)
         self.files.pop(p, None)
         return 0
+
+    def sys_symlink(self, target, linkpath, *_):
+        t, p = self.cstr(target), self._norm(self.cstr(linkpath))
+        self.log("file", "symlink", path=p, target=t)
+        self.symlinks[p] = t
+        return 0
+
+    def sys_symlinkat(self, target, newdirfd, linkpath, *_):
+        return self.sys_symlink(target, linkpath)
 
     def sys_chmod(self, path, mode, *_):
         p = self._norm(self.cstr(path))

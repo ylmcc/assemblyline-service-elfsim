@@ -15,7 +15,7 @@ from unicorn import UC_HOOK_INSN, UC_HOOK_INTR, Uc, UcError, UC_PROT_ALL
 from unicorn.x86_const import UC_X86_INS_SYSCALL
 
 from elfsim_service.arch import ARCHES, Arch
-from elfsim_service.kernel import MIN_PATH_SECONDS, PAGE, FakeKernel
+from elfsim_service.kernel import MAX_REEXECS, MIN_PATH_SECONDS, PAGE, FakeKernel
 
 STACK_SIZE = 0x100000
 MAX_IMAGE_BYTES = 128 * 1024 * 1024
@@ -57,6 +57,7 @@ class EmulationReport:
     open_counts: dict = field(default_factory=dict)  # most-opened paths (diagnostics)
     elapsed: float = 0.0
     threads_created: int = 0
+    reexecs: list = field(default_factory=list)  # {path, argv} of re-execs of its own image (emulated next)
     child_crashes: list = field(default_factory=list)  # forked paths that died on a CPU fault
     warnings: list = field(default_factory=list)  # oddities in the file itself (e.g. truncated segments)
 
@@ -83,6 +84,68 @@ def _describe_fault(uc: Uc, arch: Arch, e: UcError) -> dict:
 def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int = 50_000_000,
             timeout_s: float = 30.0, max_syscalls: int = 200_000,
             network=None) -> EmulationReport:
+    """Emulate the sample, then any re-exec of its own image it made (a bot restarting itself
+    in another mode, e.g. "<name> --guardian"), each as a fresh process that sees the files
+    written so far. Their activity is merged into one report; a process event marks each."""
+    started = time.monotonic()
+    report = _emulate_once(data, argv=argv, max_instructions=max_instructions, timeout_s=timeout_s,
+                           max_syscalls=max_syscalls, network=network)
+    queue, seen = list(report.reexecs), [r["argv"] for r in report.reexecs]
+    done = 0
+    while queue and done < MAX_REEXECS:
+        req = queue.pop(0)
+        remaining = timeout_s - (time.monotonic() - started)
+        if remaining < MIN_REEXEC_SECONDS:
+            report.warnings.append(f"re-exec {' '.join(req['argv'])} not emulated: out of time")
+            break
+        done += 1
+        report.events.append({"kind": "process", "syscall": "reexec", "path": req["path"], "argv": req["argv"],
+                              "note": "the sample re-executed its own image; emulating that process too"})
+        sub = _emulate_once(data, argv=req["argv"] or [req["path"]], exe_path=req["path"],
+                            max_instructions=max_instructions, timeout_s=remaining,
+                            max_syscalls=max_syscalls, network=network,
+                            initial_files=report.files, initial_modes=report.file_modes)
+        _merge(report, sub)
+        for r in sub.reexecs:
+            if r["argv"] not in seen:
+                seen.append(r["argv"])
+                queue.append(r)
+    report.elapsed = time.monotonic() - started
+    return report
+
+
+MIN_REEXEC_SECONDS = 3.0
+
+
+def _merge(into: EmulationReport, sub: EmulationReport) -> None:
+    """Fold a re-exec'd process's results into the report of the process that started it."""
+    into.events.extend(sub.events)
+    into.events_dropped += sub.events_dropped
+    into.network.extend(sub.network)
+    into.files.update(sub.files)
+    into.file_modes.update(sub.file_modes)
+    into.stdout += sub.stdout
+    into.sent.extend(sub.sent)
+    into.received.extend(sub.received)
+    for name, n in sub.syscall_counts.items():
+        into.syscall_counts[name] = into.syscall_counts.get(name, 0) + n
+    for name, n in sub.unknown_syscalls.items():
+        into.unknown_syscalls[name] = into.unknown_syscalls.get(name, 0) + n
+    into.syscalls_total += sub.syscalls_total
+    into.threads_created += sub.threads_created
+    into.child_crashes.extend(sub.child_crashes)
+    into.warnings.extend(w for w in sub.warnings if w not in into.warnings)
+    # The re-exec'd process is usually the long-lived one (the bot proper): its ending is the
+    # more informative stop reason. A fault in it is reported as the run's error.
+    into.stop_reason = sub.stop_reason or into.stop_reason
+    if sub.error:
+        into.error = sub.error
+
+
+def _emulate_once(data: bytes, *, argv: Optional[list] = None, exe_path: Optional[str] = None,
+                  max_instructions: int = 50_000_000, timeout_s: float = 30.0, max_syscalls: int = 200_000,
+                  network=None, initial_files: Optional[dict] = None,
+                  initial_modes: Optional[dict] = None) -> EmulationReport:
     started = time.monotonic()
     try:
         elf = ELFFile(io.BytesIO(data))
@@ -201,8 +264,11 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     kernel = FakeKernel(uc, arch, brk_base=image_end, stack_low=stack_top - STACK_SIZE,
                         max_syscalls=max_syscalls, live_net=network,
                         path_seconds=max(MIN_PATH_SECONDS, timeout_s / 4))
-    kernel.exe_path = argv[0]
+    kernel.exe_path = exe_path or argv[0]
     kernel.exe_bytes = data
+    if initial_files:                 # a re-exec'd process sees the files written before it
+        kernel.files.update({p: bytearray(b) for p, b in initial_files.items()})
+        kernel.file_modes.update(initial_modes or {})
     report = EmulationReport(arch=arch.name, entry=entry, warnings=warnings)
     fault: dict = {}
 
@@ -298,6 +364,7 @@ def emulate(data: bytes, *, argv: Optional[list] = None, max_instructions: int =
     report.unknown_syscalls = dict(kernel.unknown_syscalls)
     report.syscalls_total = kernel.syscall_count
     report.threads_created = kernel.threads_created
+    report.reexecs = list(kernel.reexecs)
     report.open_counts = dict(kernel.open_counts.most_common(20))
     report.elapsed = time.monotonic() - started
     return report

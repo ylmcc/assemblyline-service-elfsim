@@ -84,7 +84,7 @@ _I386_SYSCALLS = {
     27: "alarm", 29: "pause", 33: "access", 37: "kill", 38: "rename", 39: "mkdir",
     40: "rmdir", 41: "dup", 42: "pipe", 43: "times", 45: "brk", 48: "signal", 54: "ioctl",
     55: "fcntl", 57: "setpgid", 60: "umask", 63: "dup2", 64: "getppid", 65: "getpgrp",
-    66: "setsid", 67: "sigaction", 75: "setrlimit", 76: "getrlimit", 78: "gettimeofday",
+    66: "setsid", 67: "sigaction", 72: "sigsuspend", 83: "symlink", 179: "rt_sigsuspend", 304: "symlinkat", 75: "setrlimit", 76: "getrlimit", 78: "gettimeofday",
     82: "select", 85: "readlink", 90: "mmap", 91: "munmap", 102: "socketcall",
     106: "stat", 107: "lstat", 108: "fstat", 114: "wait4", 116: "sysinfo", 118: "fsync",
     119: "sigreturn", 120: "clone", 122: "uname", 125: "mprotect", 140: "_llseek",
