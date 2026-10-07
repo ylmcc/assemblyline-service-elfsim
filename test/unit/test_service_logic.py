@@ -368,3 +368,11 @@ def test_symlinks_into_rc_directories_count_as_boot_persistence():
         {"kind": "file", "syscall": "symlink", "path": "/tmp/harmless-link", "target": "/tmp/x"},
     ])
     assert _persistence(report) == [("rc_script", "boot / init script", "T1037.004", "/etc/rc2.d/S90svc")]
+
+
+def test_heuristic_attack_ids_are_lists():
+    """AL's Rust service-server rejects a scalar attack_id ("invalid type: string, expected a
+    sequence") and with it the whole service registration -- new versions never install."""
+    for heur in yaml.safe_load(open(MANIFEST_PATH))["heuristics"]:
+        if "attack_id" in heur:
+            assert isinstance(heur["attack_id"], list), heur["heur_id"]

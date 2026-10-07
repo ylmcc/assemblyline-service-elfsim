@@ -63,13 +63,13 @@ heuristics:
       udp_connect: 0
       udp_probe: 0
       bind_port: 0
-    attack_id: T1095
+    attack_id: [T1095]
   - heur_id: 3
     name: DNS lookup
     description: The sample tried to resolve a domain name during emulation (informational; the domain is tagged for reputation checks).
     filetype: ".*"
     score: 0
-    attack_id: T1071.004
+    attack_id: [T1071.004]
   - heur_id: 4
     name: Data sent to remote host
     description: The bytes the sample tried to send to a remote host (e.g. a C2 registration message).
@@ -113,8 +113,7 @@ heuristics:
     signature_score_map:
       data_received: 0
       payload_received: 300
-    attack_id: T1105
-
+    attack_id: [T1105]
   - heur_id: 9
     name: Raw packets built by the sample
     description: The sample sent hand-built IP packets through a raw socket; to many distinct hosts this is scanning (e.g. a Telnet SYN scanner).
@@ -124,8 +123,7 @@ heuristics:
     signature_score_map:
       syn_scan: 300
       raw_packets: 0
-    attack_id: T1595
-
+    attack_id: [T1595]
   - heur_id: 10
     name: Persistence installed
     description: The sample set itself up to survive a reboot or re-login (cron job, init/rc script, systemd service, shell startup file, udev rule, DHCP hook or router boot setting).
